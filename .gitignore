@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+downloads/
+*.mp3
+*.m4a
+*.webm
+cookies.txt
+*.sqlite3
+typetube-api-key
+.venv/
+venv/
