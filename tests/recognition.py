@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -44,59 +44,97 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
             "https://example.com/video"
         ))
 
-    def test_song_audio_is_transcoded_to_configured_mp3_bitrate(self):
-        track = {
+    def test_song_audio_uses_ytdlp_and_returns_temp_mp3(self):
+        info = {
             "id": "abcdefghijk",
             "title": "Song",
-            "author": "Artist",
+            "uploader": "Artist",
             "duration": 180,
-            "thumbnail": None,
-            "formats": [],
+            "thumbnail": "https://i.ytimg.com/vi/abcdefghijk/default.jpg",
         }
-        source_format = {
-            "mimeType": "audio/mp4",
-            "url": "https://stream.example/audio",
-        }
+        downloader = MagicMock()
+        downloader.__enter__.return_value = downloader
+        options_seen = {}
 
-        def download(_stream, destination, max_bytes):
-            destination.write_bytes(b"source audio" * 200)
-            return destination.stat().st_size
+        def extract_info(_target, download):
+            self.assertTrue(download)
+            template = options_seen["options"]["outtmpl"]
+            path = Path(
+                template.replace("%(id)s", info["id"])
+                .replace("%(ext)s", "mp3")
+            )
+            path.write_bytes(b"mp3 audio" * 200)
+            for hook in options_seen["options"]["progress_hooks"]:
+                hook({"info_dict": info})
+            return info
 
-        def transcode(command, **_kwargs):
-            Path(command[-1]).write_bytes(b"mp3 output" * 200)
-            return SimpleNamespace(returncode=0, stderr=b"")
+        downloader.extract_info.side_effect = extract_info
+        metadata = []
+
+        def create_downloader(options):
+            options_seen["options"] = options
+            return downloader
 
         with (
-            patch.object(emy_bot.youtube, "resolve", return_value=track),
             patch.object(
-                emy_bot.youtube,
-                "select_audio_format",
-                return_value=source_format,
-            ),
-            patch.object(
-                emy_bot.youtube, "format_extension", return_value=".m4a"
-            ),
-            patch.object(
-                emy_bot.youtube,
-                "download_format",
-                side_effect=download,
-            ),
-            patch.object(
-                emy_bot.subprocess, "run", side_effect=transcode
-            ) as ffmpeg,
+                emy_bot.yt_dlp,
+                "YoutubeDL",
+                side_effect=create_downloader,
+            ) as youtube_dl,
             patch.object(emy_bot, "fetch_cover_jpeg", return_value=None),
+            patch.object(emy_bot.youtube, "resolve") as player_resolve,
+            patch.object(emy_bot.youtube, "download_format") as own_downloader,
         ):
             result = emy_bot.download_song_to_ram(
-                "https://www.youtube.com/watch?v=abcdefghijk"
+                "https://music.youtube.com/watch?v=abcdefghijk",
+                metadata.append,
             )
 
         self.assertEqual(result["audio_filename"], "abcdefghijk.mp3")
+        self.assertEqual(result["duration"], 180)
+        self.assertEqual(result["title"], "Song")
+        youtube_dl.assert_called_once()
+        options = options_seen["options"]
+        self.assertEqual(options["format"], "bestaudio/best")
+        self.assertFalse(options["cachedir"])
+        self.assertEqual(options["max_filesize"], emy_bot.MAX_FILE_MB * 1024 * 1024)
+        self.assertEqual(options["postprocessors"][0]["preferredcodec"], "mp3")
         self.assertEqual(
-            ffmpeg.call_args.args[0][
-                ffmpeg.call_args.args[0].index("-b:a") + 1
-            ],
-            f"{emy_bot.MP3_QUALITY}k",
+            options["postprocessors"][0]["preferredquality"],
+            str(emy_bot.MP3_QUALITY),
         )
+        self.assertEqual(
+            metadata,
+            ["Song · Artist"],
+        )
+        downloader.extract_info.assert_called_once_with(
+            "https://music.youtube.com/watch?v=abcdefghijk",
+            download=True,
+        )
+        player_resolve.assert_not_called()
+        own_downloader.assert_not_called()
+
+    def test_song_download_explains_youtube_403_recovery(self):
+        downloader = MagicMock()
+        downloader.__enter__.return_value = downloader
+        downloader.extract_info.side_effect = emy_bot.yt_dlp.utils.DownloadError(
+            "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+        )
+        with patch.object(
+            emy_bot.yt_dlp, "YoutubeDL", return_value=downloader
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, "yt-dlp\\[default\\].*Python 3.11"
+            ):
+                emy_bot.download_song_to_ram("https://youtu.be/abcdefghijk")
+
+    def test_song_download_rejects_non_youtube_links_before_ytdlp(self):
+        with patch.object(emy_bot.yt_dlp, "YoutubeDL") as youtube_dl:
+            with self.assertRaisesRegex(ValueError, "YouTube link"):
+                emy_bot.download_song_to_ram(
+                    "https://example.com/watch?v=abcdefghijk"
+                )
+        youtube_dl.assert_not_called()
 
     def test_recognizes_only_audio_and_video_upload_types(self):
         self.assertTrue(recognition.is_audio_or_video("audio/mpeg", "track"))
@@ -129,6 +167,7 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
             1.0,
         )
         self.assertEqual(recognition.title_match_ratio("Na Jaane", "Other Song"), 0.0)
+        self.assertEqual(recognition.title_match_ratio("Hello", "Hello"), 1.0)
 
     async def test_shazam_recognition_does_not_require_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -405,7 +444,7 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         )
         candidate = {
             "id": "song-id",
-            "track": "Song Name",
+            "track": "Hello",
             "artist": "Artist Name",
         }
         with patch.object(
@@ -416,7 +455,7 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
             recognition,
             "recognize_sample",
             new=AsyncMock(return_value={
-                "title": "Song Name",
+                "title": "Hello",
                 "artist": "Artist Name",
             }),
         ), patch.object(
@@ -440,6 +479,10 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         )
         status.delete.assert_awaited_once()
         deliver_song.assert_awaited_once()
+        self.assertEqual(
+            deliver_song.await_args.args[1].args,
+            ["Hello by Artist Name"],
+        )
         self.assertEqual(
             deliver_song.await_args.args[1].recognition_candidate,
             candidate,

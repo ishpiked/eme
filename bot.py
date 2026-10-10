@@ -21,6 +21,7 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
+import yt_dlp
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
@@ -461,135 +462,182 @@ def embed_cover_mp3(mp3_path: Path, cover_bytes: bytes) -> bool:
 def download_song_to_ram(
     query: str, metadata_callback=None, picked_override: dict | None = None
 ) -> dict:
-    """Resolve/download a YouTube player stream, transcode it, and return bytes."""
-    is_url = bool(URL_RE.match(query.strip()))
-    if is_url:
-        target = query.strip()
+    """Download and extract MP3 audio with yt-dlp into a temporary directory."""
+    query = str(query or "").strip()
+    picked = picked_override
+    if URL_RE.match(query):
+        if not recognition.validate_media_url(query):
+            raise ValueError("Use a supported public YouTube video or Music link.")
+        target = query
+        video_id = youtube.get_video_id(target)
     else:
         resolve_started = time.perf_counter()
-        picked = picked_override or resolve_official(query)
-        logger.info("SOURCE_RESOLVE took %.2fs", time.perf_counter() - resolve_started)
+        if not picked:
+            picked = resolve_official(query)
+        logger.info(
+            "SOURCE_RESOLVE provider=YouTubeSearch took %.2fs",
+            time.perf_counter() - resolve_started,
+        )
         if not picked or not picked.get("id"):
             raise ValueError(
                 "No confident matching track was found. Try including the artist or version."
             )
-        target = f"https://www.youtube.com/watch?v={picked['id']}"
-    resolve_started = time.perf_counter()
-    track = youtube.resolve(target)
-    resolve_seconds = time.perf_counter() - resolve_started
-    logger.info(
-        "SOURCE_RESOLVE provider=YouTubePlayer took %.2fs id=%s",
-        resolve_seconds, track["id"],
-    )
-    audio_format = youtube.select_audio_format(track["formats"])
-
-    duration = int(track["duration"] or 0)
-    if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
-        raise ValueError(
-            f"Too long ({duration // 60}:{duration % 60:02d}). "
-            f"Max allowed is {MAX_DURATION_SEC // 60} min."
+        video_id = youtube.get_video_id(str(picked["id"]))
+        candidate_url = str(picked.get("webpage_url") or picked.get("url") or "")
+        target = (
+            candidate_url
+            if recognition.validate_media_url(candidate_url)
+            and youtube.get_video_id(candidate_url) == video_id
+            else f"https://www.youtube.com/watch?v={video_id}"
         )
-    track_title = track["title"] or (picked_override or {}).get("title") or query
-    track_artist = track["author"] or (picked_override or {}).get("artist") or ""
-    display_title, display_artist = curate_track(track_title, track_artist)
-    if metadata_callback:
-        label = f"{display_title} · {display_artist}" if display_artist else display_title
+
+    callback_sent = False
+
+    def report_metadata(info: dict) -> None:
+        nonlocal callback_sent
+        if callback_sent or not metadata_callback:
+            return
+        title = str(info.get("track") or info.get("title") or query)
+        artist = str(
+            info.get("artist")
+            or info.get("creator")
+            or info.get("author")
+            or info.get("uploader")
+            or info.get("channel")
+            or ""
+        )
+        display_title, display_artist = curate_track(title, artist)
+        label = (
+            f"{display_title} · {display_artist}"
+            if display_artist else display_title
+        )
         try:
             metadata_callback(label)
+            callback_sent = True
         except Exception as error:
             logger.warning("Could not report resolved track metadata: %s", error)
 
-    source_suffix = youtube.format_extension(audio_format)
+    def progress_hook(event: dict) -> None:
+        info = event.get("info_dict")
+        if isinstance(info, dict):
+            report_metadata(info)
+
+    def duration_filter(info: dict, *, incomplete: bool) -> str | None:
+        del incomplete
+        try:
+            duration = int(info.get("duration") or 0)
+        except (TypeError, ValueError, OverflowError):
+            duration = 0
+        if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
+            maximum = MAX_DURATION_SEC
+            return (
+                f"Too long ({int(duration) // 60}:{int(duration) % 60:02d}). "
+                f"Max allowed is {maximum // 60} min."
+            )
+        return None
+
     with tempfile.TemporaryDirectory(prefix="songbot_") as tmpdir:
-        source_path = Path(tmpdir) / f"{track['id']}{source_suffix}"
+        options = {
+            "format": "bestaudio/best",
+            "outtmpl": str(Path(tmpdir) / "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "cachedir": False,
+            "socket_timeout": 20,
+            "retries": 3,
+            "fragment_retries": 3,
+            "concurrent_fragment_downloads": 8,
+            "match_filter": duration_filter,
+            "progress_hooks": [progress_hook],
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": str(MP3_QUALITY),
+            }],
+        }
+        if MAX_FILE_MB:
+            options["max_filesize"] = MAX_FILE_MB * 1024 * 1024
+
         download_started = time.perf_counter()
         try:
-            bytes_written = youtube.download_format(
-                audio_format,
-                source_path,
-                max_bytes=MAX_FILE_MB * 1024 * 1024 if MAX_FILE_MB else None,
-            )
-        except urllib.error.HTTPError as error:
-            if error.code != 403:
-                raise
-            logger.warning(
-                "YouTube stream returned HTTP 403; refreshing its direct URL once."
-            )
-            track = youtube.resolve(target)
-            audio_format = youtube.select_audio_format(track["formats"])
-            source_suffix = youtube.format_extension(audio_format)
-            source_path = Path(tmpdir) / f"{track['id']}{source_suffix}"
-            duration = int(track["duration"] or 0)
-            if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
-                raise ValueError(
-                    f"Too long ({duration // 60}:{duration % 60:02d}). "
-                    f"Max allowed is {MAX_DURATION_SEC // 60} min."
+            with yt_dlp.YoutubeDL(options) as downloader:
+                info = downloader.extract_info(target, download=True)
+        except yt_dlp.utils.DownloadError as error:
+            if "HTTP Error 403" in str(error):
+                raise RuntimeError(
+                    "YouTube refused the audio stream (HTTP 403). Update the bot "
+                    "environment with `pip install --upgrade \"yt-dlp[default]\"`, "
+                    "use Python 3.11 or newer, and install a JavaScript runtime "
+                    "such as Deno. Some videos may still be blocked from the "
+                    "server's network."
                 ) from error
-            bytes_written = youtube.download_format(
-                audio_format,
-                source_path,
-                max_bytes=MAX_FILE_MB * 1024 * 1024 if MAX_FILE_MB else None,
-            )
+            raise RuntimeError(str(error).strip()[:400]) from error
         download_seconds = time.perf_counter() - download_started
-        if not source_path.is_file() or source_path.stat().st_size < 1024:
-            raise RuntimeError("YouTube audio download did not produce a file.")
-        average_speed = bytes_written / (1024 * 1024) / max(download_seconds, 0.01)
-        logger.info(
-            "SOURCE_DOWNLOAD provider=YouTubePlayer took %.2fs size=%.2fMB effective=%.2fMB/s",
-            download_seconds,
-            bytes_written / (1024 * 1024),
-            average_speed,
-        )
-        source_mb = source_path.stat().st_size / (1024 * 1024)
-        if MAX_FILE_MB and source_mb > MAX_FILE_MB:
-            raise ValueError(
-                f"Source audio is too large ({source_mb:.1f} MB > {MAX_FILE_MB} MB)."
-            )
-        mp3_path = Path(tmpdir) / f"{track['id']}.mp3"
-        transcode_started = time.perf_counter()
-        proc = subprocess.run(
-            [
-                "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source_path),
-                "-vn", "-codec:a", "libmp3lame", "-b:a", f"{MP3_QUALITY}k",
-                "-threads", "0", str(mp3_path),
-            ],
-            capture_output=True,
-            timeout=120,
-        )
-        if proc.returncode or not mp3_path.is_file() or mp3_path.stat().st_size < 1024:
-            detail = proc.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(
-                f"Could not convert YouTube audio to MP3: {detail[:200]}"
-            )
-        logger.info(
-            "SOURCE_TRANSCODE provider=YouTubePlayer took %.2fs bitrate=%sk",
-            time.perf_counter() - transcode_started,
-            MP3_QUALITY,
-        )
-        output_path = mp3_path
-        output_suffix = ".mp3"
-        size_mb = output_path.stat().st_size / (1024 * 1024)
-        if MAX_FILE_MB and size_mb > MAX_FILE_MB:
+        if not isinstance(info, dict):
+            raise RuntimeError("yt-dlp did not return track metadata.")
+
+        video_id = youtube.get_video_id(str(info.get("id") or video_id))
+        output_path = Path(tmpdir) / f"{video_id}.mp3"
+        if not output_path.is_file() or output_path.stat().st_size < 1024:
+            raise RuntimeError("yt-dlp did not produce an MP3 audio file.")
+        output_size = output_path.stat().st_size
+        size_mb = output_size / (1024 * 1024)
+        if MAX_FILE_MB and output_size > MAX_FILE_MB * 1024 * 1024:
             raise ValueError(
                 f"File too large ({size_mb:.1f} MB > {MAX_FILE_MB} MB). "
                 "Try a shorter song."
             )
-        video_id = track["id"]
+
+        duration = int(info.get("duration") or 0)
+        if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
+            raise ValueError(
+                f"Too long ({duration // 60}:{duration % 60:02d}). "
+                f"Max allowed is {MAX_DURATION_SEC // 60} min."
+            )
+        track_title = (
+            info.get("track")
+            or info.get("title")
+            or (picked or {}).get("title")
+            or query
+        )
+        track_artist = (
+            info.get("artist")
+            or info.get("creator")
+            or info.get("author")
+            or info.get("uploader")
+            or info.get("channel")
+            or (picked or {}).get("artist")
+            or ""
+        )
+        display_title, display_artist = curate_track(
+            str(track_title), str(track_artist)
+        )
+        report_metadata({
+            "title": display_title,
+            "artist": display_artist or "",
+        })
+        logger.info(
+            "SOURCE_DOWNLOAD provider=yt-dlp took %.2fs size=%.2fMB bitrate=%sk",
+            download_seconds,
+            size_mb,
+            MP3_QUALITY,
+        )
         cover_bytes = fetch_cover_jpeg(video_id)
-        if cover_bytes and output_suffix == ".mp3":
+        if cover_bytes:
             embed_cover_mp3(output_path, cover_bytes)
         audio_bytes = output_path.read_bytes()
 
     return {
         "audio_bytes": audio_bytes,
-        "audio_filename": f"{video_id}{output_suffix}",
+        "audio_filename": f"{video_id}.mp3",
         "cover_bytes": cover_bytes,
         "size_mb": size_mb,
         "title": display_title,
         "uploader": display_artist,
         "duration": duration,
-        "album": None,
-        "thumbnail": track["thumbnail"],
+        "album": info.get("album"),
+        "thumbnail": info.get("thumbnail"),
         "webpage_url": target,
         "id": video_id,
     }
@@ -2133,7 +2181,10 @@ def _store_recognition_request(
 
 
 async def receive_recognition_input(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    media_url: str | None = None,
 ) -> None:
     message = update.effective_message
     user = update.effective_user
@@ -2144,7 +2195,13 @@ async def receive_recognition_input(
     if pending and pending.get("expires", 0) >= time.time():
         return
 
-    source = _recognition_media(message)
+    source = (
+        {"kind": "url", "url": media_url}
+        if media_url and recognition.validate_media_url(media_url)
+        else {"kind": "unsupported_url"}
+        if media_url
+        else _recognition_media(message)
+    )
     if not source:
         return
     if source["kind"] == "url" and recognition.is_music_url(source["url"]):
@@ -2363,10 +2420,7 @@ async def _recognize_song_callback(query, context: ContextTypes.DEFAULT_TYPE) ->
         candidate_title, _ = curate_track(
             derive_title(candidate), derive_artist(candidate)
         )
-        if (
-            len(re.findall(r"[^\W_]+", match["title"], flags=re.UNICODE)) < 2
-            or recognition.title_match_ratio(match["title"], candidate_title) < 0.75
-        ):
+        if recognition.title_match_ratio(match["title"], candidate_title) < 0.75:
             raise recognition.RecognitionError(
                 "The catalog result did not match the recognized title closely enough."
             )
@@ -3169,7 +3223,7 @@ async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Play a link or video id straight away, with the user's saved effect."""
+    """Preview YouTube videos; play YouTube Music links as audio."""
     if not context.args:
         await update.message.reply_text(
             status_html(
@@ -3197,6 +3251,13 @@ async def play_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             warn_html("Nothing to play", "Send a link or a video id after /play."),
             parse_mode="HTML",
         )
+        return
+    if (
+        not no_controls
+        and recognition.validate_media_url(target)
+        and not recognition.is_music_url(target)
+    ):
+        await receive_recognition_input(update, context, media_url=target)
         return
     delivery_update = SimpleNamespace(
         message=update.effective_message,

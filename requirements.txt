@@ -2,3 +2,4 @@ python-telegram-bot>=22.8
 python-dotenv>=1.0.0
 aiohttp>=3.9
 shazamio>=0.8.1,<0.9.0
+yt-dlp[default]>=2025.1.15

@@ -876,7 +876,7 @@ class TelegramFeatureTests(unittest.IsolatedAsyncioTestCase):
             rows[0][0]["icon_custom_emoji_id"], "5280867942056108177"
         )
 
-    async def test_play_cmd_downloads_link_directly(self):
+    async def test_play_cmd_sends_video_link_to_preview_flow(self):
         url = "https://www.youtube.com/watch?v=abc"
         update = SimpleNamespace(
             message=SimpleNamespace(),
@@ -888,16 +888,12 @@ class TelegramFeatureTests(unittest.IsolatedAsyncioTestCase):
             args=[url], bot=SimpleNamespace(), application=SimpleNamespace()
         )
         with patch.object(
-            emy_bot, "song", new=AsyncMock()
-        ) as deliver:
+            emy_bot, "receive_recognition_input", new=AsyncMock()
+        ) as preview:
             await emy_bot.play_cmd(update, context)
-        deliver.assert_awaited_once()
-        delivery_update, delivery_context = deliver.await_args.args
-        self.assertEqual(delivery_context.args, [url])
-        self.assertEqual(delivery_update.effective_user.id, 42)
-        self.assertEqual(delivery_update.effective_chat.id, 9)
+        preview.assert_awaited_once_with(update, context, media_url=url)
 
-    async def test_play_cmd_accepts_raw_video_ids(self):
+    async def test_play_cmd_routes_video_ids_to_preview_flow(self):
         update = SimpleNamespace(
             message=SimpleNamespace(),
             effective_message=SimpleNamespace(),
@@ -909,14 +905,30 @@ class TelegramFeatureTests(unittest.IsolatedAsyncioTestCase):
             application=SimpleNamespace(),
         )
         with patch.object(
-            emy_bot, "song", new=AsyncMock()
-        ) as deliver:
+            emy_bot, "receive_recognition_input", new=AsyncMock()
+        ) as preview:
+            await emy_bot.play_cmd(update, context)
+        preview.assert_awaited_once_with(
+            update,
+            context,
+            media_url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        )
+
+    async def test_play_cmd_sends_youtube_music_link_to_audio_flow(self):
+        url = "https://music.youtube.com/watch?v=abcdefghijk"
+        update = SimpleNamespace(
+            message=SimpleNamespace(),
+            effective_message=SimpleNamespace(),
+            effective_user=SimpleNamespace(id=42),
+            effective_chat=SimpleNamespace(id=9),
+        )
+        context = SimpleNamespace(
+            args=[url], bot=SimpleNamespace(), application=SimpleNamespace()
+        )
+        with patch.object(emy_bot, "song", new=AsyncMock()) as deliver:
             await emy_bot.play_cmd(update, context)
         deliver.assert_awaited_once()
-        self.assertEqual(
-            deliver.await_args.args[1].args,
-            ["https://www.youtube.com/watch?v=dQw4w9WgXcQ"],
-        )
+        self.assertEqual(deliver.await_args.args[1].args, [url])
 
     async def test_play_cmd_inline_option_suppresses_controls(self):
         url = "https://www.youtube.com/watch?v=abc"
