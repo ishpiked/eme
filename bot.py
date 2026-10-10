@@ -31,7 +31,9 @@ from telegram import (
     BotCommandScopeDefault,
     InputFile,
     InputMediaAudio,
+    InlineQueryResultArticle,
     InlineQueryResultAudio,
+    InputTextMessageContent,
     Update,
 )
 from telegram.constants import ChatAction
