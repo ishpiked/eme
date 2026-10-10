@@ -4,6 +4,7 @@ import re
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1491,6 +1492,69 @@ class TelegramFeatureTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TypeTubeResolutionTests(unittest.TestCase):
+    def test_forbidden_stream_refreshes_url_and_retries_with_fewer_workers(self):
+        audio = SimpleNamespace(url="https://stream.example/old")
+        refreshed_track = SimpleNamespace(
+            success=True,
+            best_audio=SimpleNamespace(url="https://stream.example/new"),
+        )
+
+        class FakeClient:
+            def __init__(self):
+                self.attempts = []
+
+            def download_audio(self, track, **kwargs):
+                self.attempts.append((track, kwargs))
+                if len(self.attempts) == 1:
+                    raise urllib.error.HTTPError(
+                        audio.url, 403, "Forbidden", {}, None
+                    )
+                Path(kwargs["output_path"]).write_bytes(b"x" * 2048)
+                return SimpleNamespace(
+                    bytes_written=2048,
+                    average_speed_mbps=1.0,
+                )
+
+        client = FakeClient()
+        refreshed_client = FakeClient()
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch.object(emy_bot.os, "pwrite", lambda *_args: 0, create=True),
+            patch.object(
+                emy_bot,
+                "_resolve_typetube_track",
+                return_value=(refreshed_client, refreshed_track),
+            ) as resolve,
+        ):
+            path = Path(tmpdir) / "track.m4a"
+            selected_client, track, written, speed = (
+                emy_bot._download_typetube_source(
+                    client, SimpleNamespace(best_audio=audio), "track-id", path
+                )
+            )
+
+        resolve.assert_called_once_with("track-id")
+        self.assertIs(selected_client, refreshed_client)
+        self.assertIs(track, refreshed_track)
+        self.assertEqual(written, 2048)
+        self.assertEqual(speed, 1.0)
+        self.assertEqual(client.attempts[0][1]["workers"], 8)
+        self.assertEqual(refreshed_client.attempts[0][1]["workers"], 4)
+        self.assertEqual(
+            refreshed_client.attempts[0][1]["chunk_size"],
+            4 * 1024 * 1024,
+        )
+        self.assertEqual(path.stat().st_size, 2048)
+
+    def test_forbidden_download_error_is_user_friendly(self):
+        error = urllib.error.HTTPError(
+            "https://stream.example/audio", 403, "Forbidden", {}, None
+        )
+        self.assertEqual(
+            emy_bot.friendly_error(error),
+            "The audio source temporarily refused the download. Please try again.",
+        )
+
     def test_public_tier_succeeds_without_reading_owner_key(self):
         class FakeTypeTubeError(Exception):
             pass
@@ -1587,6 +1651,58 @@ class TypeTubeResolutionTests(unittest.TestCase):
             emy_bot.friendly_error(FakeTypeTubeError("private provider quota details")),
         )
         self.assertIn("/playlist", emy_bot.HELP_HTML)
+
+
+class SearchResultCacheTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capped_partial_catalog_results_are_reused(self):
+        previous_cache = dict(emy_bot.SEARCH_RESULT_CACHE)
+        emy_bot.SEARCH_RESULT_CACHE.clear()
+        entries = [{"id": "track-1", "title": "Track"}]
+        try:
+            with patch.object(
+                emy_bot, "_search_typetube_catalog", return_value=entries
+            ) as search:
+                first = await emy_bot.resolve_candidates_async(
+                    "Track", None, limit=50
+                )
+                second = await emy_bot.resolve_candidates_async(
+                    "track", None, limit=50
+                )
+            self.assertEqual(first, entries)
+            self.assertEqual(second, entries)
+            search.assert_called_once_with("Track", 25)
+        finally:
+            emy_bot.SEARCH_RESULT_CACHE.clear()
+            emy_bot.SEARCH_RESULT_CACHE.update(previous_cache)
+
+    def test_typetube_catalog_maps_results_to_song_candidates(self):
+        hit = SimpleNamespace(
+            id="abc123",
+            title="Song title",
+            uploader="Artist",
+            duration=201,
+            url="https://www.youtube.com/watch?v=abc123",
+        )
+        client = SimpleNamespace(
+            search=lambda query, limit, timeout: [hit]
+        )
+        fake_typetube = SimpleNamespace(
+            TypeTubeError=type("FakeTypeTubeError", (Exception,), {}),
+            create_client=lambda **_kwargs: client,
+        )
+
+        with patch.dict("sys.modules", {"typetube": fake_typetube}):
+            results = emy_bot._search_typetube_catalog("Song title", 10)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["id"], "abc123")
+        self.assertEqual(results[0]["title"], "Song title")
+        self.assertEqual(results[0]["artist"], "Artist")
+        self.assertEqual(results[0]["duration"], 201)
+        self.assertEqual(
+            results[0]["webpage_url"],
+            "https://www.youtube.com/watch?v=abc123",
+        )
 
 
 if __name__ == "__main__":

@@ -17,7 +17,6 @@ from __future__ import annotations
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -157,8 +156,9 @@ def search(query: str, limit: int = 20) -> list[dict]:
 
     Official ``songs`` are preferred; ``videos`` fill the remainder so
     version queries (slowed/remix/live) still find playable uploads.
-    Both filters run concurrently so wall time is a single call, not two.
-    Order is YouTube Music relevance order.
+    Official songs are searched first. The broader video filter is only queried
+    when the song result set is too small, avoiding an unnecessary network call
+    for common searches.
     """
     if not query or not query.strip():
         return []
@@ -172,17 +172,11 @@ def search(query: str, limit: int = 20) -> list[dict]:
 
     client = YTMusic()
     text = query.strip()
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        songs_future = pool.submit(_filter_search, client, text, "songs", limit)
-        videos_future = pool.submit(
-            _filter_search, client, text, "videos", max(10, limit // 2)
-        )
-        songs = songs_future.result()
-        videos = videos_future.result()
+    songs = _filter_search(client, text, "songs", limit)
 
     entries: list[dict] = []
     seen: set[str] = set()
-    for raw in list(songs) + list(videos):
+    for raw in songs:
         entry = normalize_item(raw)
         if not entry or entry["id"] in seen:
             continue
@@ -190,6 +184,19 @@ def search(query: str, limit: int = 20) -> list[dict]:
         entries.append(entry)
         if len(entries) >= limit:
             break
+
+    if len(entries) < limit:
+        videos = _filter_search(
+            client, text, "videos", max(10, limit // 2)
+        )
+        for raw in videos:
+            entry = normalize_item(raw)
+            if not entry or entry["id"] in seen:
+                continue
+            seen.add(entry["id"])
+            entries.append(entry)
+            if len(entries) >= limit:
+                break
     logger.info(
         "CATALOG_SEARCH query=%r results=%d elapsed=%.2fs",
         query[:80], len(entries), time.perf_counter() - started,

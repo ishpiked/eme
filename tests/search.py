@@ -105,6 +105,21 @@ class YTMusicSearchTests(unittest.TestCase):
             results = ytmusic.search("query", limit=2)
         self.assertEqual([entry["id"] for entry in results], ["dup", "song-2"])
 
+    def test_search_skips_video_request_when_song_results_fill_limit(self):
+        songs = [_raw_song("song-1"), _raw_song("song-2")]
+        calls = []
+
+        class FakeClient:
+            def search(self, query, filter=None, limit=None):
+                calls.append((filter, limit))
+                return songs
+
+        with patch("ytmusicapi.YTMusic", return_value=FakeClient()):
+            results = ytmusic.search("query", limit=2)
+
+        self.assertEqual([entry["id"] for entry in results], ["song-1", "song-2"])
+        self.assertEqual(calls, [("songs", 2)])
+
     def test_search_returns_empty_on_blank_query_or_failure(self):
         self.assertEqual(ytmusic.search("   ", limit=10), [])
 

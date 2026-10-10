@@ -17,6 +17,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -230,18 +231,93 @@ def curate_track(raw_title: str, raw_artist: str) -> tuple:
 
 
 def resolve_official(query: str) -> dict | None:
-    """Return the top YouTube Music hit for ``query`` (blocking; run in a thread)."""
-    best = ytmusic.search_one(query)
-    if not best:
-        return None
-    logger.info(
-        "PICK '%s' -> %s | %s",
-        query, best.get("id"), (best.get("title") or "")[:60],
-    )
+    """Return the top TypeTube catalog hit for ``query``."""
+    results = _search_typetube_catalog(query, 1)
+    best = results[0] if results else None
+    if best:
+        logger.info(
+            "PICK '%s' -> %s | %s",
+            query, best.get("id"), (best.get("title") or "")[:60],
+        )
     return best
 
 
-SEARCH_RESULT_CACHE: dict[str, tuple[float, list[dict]]] = {}
+TYPE_TUBE_SEARCH_TIMEOUT = 4.0
+TYPE_TUBE_RESOLVE_TIMEOUT = 6.0
+
+
+def _search_typetube_catalog(query: str, limit: int) -> list[dict]:
+    """Fetch relevance-ranked search results from TypeTube's single-call API."""
+    from typetube import TypeTubeError, create_client
+
+    public_client = create_client(
+        endpoint=owner.TYPE_TUBE_ENDPOINT,
+        api_key="public",
+        timeout=TYPE_TUBE_SEARCH_TIMEOUT,
+    )
+    try:
+        items = public_client.search(
+            query, limit=limit, timeout=TYPE_TUBE_SEARCH_TIMEOUT
+        )
+    except TypeTubeError as error:
+        if not _is_typetube_public_limit(error):
+            raise
+        try:
+            private_key = owner.get_typetube_api_key()
+        except OSError as key_error:
+            logger.exception("Could not read the owner-managed TypeTube key.")
+            raise TypeTubeOwnerKeyUnavailable from key_error
+        if not private_key:
+            raise TypeTubeFreeQuotaExhausted from error
+        logger.info(
+            "TypeTube public search quota is exhausted; falling back to the owner key."
+        )
+        private_client = create_client(
+            endpoint=owner.TYPE_TUBE_ENDPOINT,
+            api_key=private_key,
+            timeout=TYPE_TUBE_SEARCH_TIMEOUT,
+        )
+        try:
+            items = private_client.search(
+                query, limit=limit, timeout=TYPE_TUBE_SEARCH_TIMEOUT
+            )
+        except TypeTubeError as key_error:
+            if _is_typetube_public_limit(key_error):
+                logger.error("TypeTube owner-key search failed: %s", key_error)
+                raise TypeTubeOwnerKeyUnavailable from key_error
+            raise
+
+    entries = []
+    for item in items or []:
+        video_id = str(getattr(item, "id", "") or "").strip()
+        if not video_id:
+            continue
+        title = str(getattr(item, "title", "") or "").strip() or "Unknown title"
+        artist = str(getattr(item, "uploader", "") or "").strip()
+        url = str(getattr(item, "url", "") or "").strip()
+        duration = getattr(item, "duration", None)
+        try:
+            duration = int(duration or 0)
+        except (TypeError, ValueError):
+            duration = 0
+        entries.append({
+            "id": video_id,
+            "videoId": video_id,
+            "title": title,
+            "track": title,
+            "artist": artist,
+            "artists": [artist] if artist else [],
+            "album": None,
+            "duration": duration,
+            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
+            "channel": artist,
+            "uploader": artist,
+            "webpage_url": url or f"https://www.youtube.com/watch?v={video_id}",
+        })
+    return entries
+
+
+SEARCH_RESULT_CACHE: dict[str, tuple[float, int, list[dict]]] = {}
 SEARCH_SELECTIONS: dict[str, dict] = {}
 SEARCH_RESULT_TTL = 300
 SEARCH_SELECTION_TTL = 600
@@ -250,37 +326,44 @@ SEARCH_SELECTION_TTL = 600
 async def resolve_candidates_async(
     query: str, application, limit: int = 6
 ) -> list[dict]:
-    """Search the YouTube Music catalog (fast, relevance ordered).
+    """Search TypeTube's catalog (one bounded API call, relevance ordered).
 
     ``application`` is kept for call compatibility; results are cached in
-    memory for five minutes. No Spotify cross check, no query fallbacks:
-    YouTube Music already returns relevance ranked music hits.
+    memory for five minutes. No Spotify cross check or slower secondary search.
     """
     cache_key = ytmusic.normalize_query(query)
-    cached = SEARCH_RESULT_CACHE.get(cache_key)
     now = time.time()
     fetch = min(25, max(limit, 10))
-    if cached and cached[0] > now and len(cached[1]) >= limit:
+    cached = SEARCH_RESULT_CACHE.get(cache_key)
+    if cached and cached[0] > now and cached[1] >= fetch:
         logger.info(
             "CATALOG_CACHE_HIT query=%r results=%d",
-            query[:80], min(len(cached[1]), limit),
+            query[:80], min(len(cached[2]), limit),
         )
-        return [dict(entry) for entry in cached[1][:limit]]
+        return [dict(entry) for entry in cached[2][:limit]]
     SEARCH_RESULT_CACHE.pop(cache_key, None)
 
+    search_started = time.perf_counter()
     try:
-        entries = await asyncio.to_thread(ytmusic.search, query, fetch)
+        entries = await asyncio.to_thread(
+            _search_typetube_catalog, query, fetch
+        )
     except Exception as error:
         logger.error(
-            "YouTube Music search failed for %r: %s",
+            "TypeTube catalog search failed for %r: %s",
             query[:100], type(error).__name__,
         )
-        return []
+        raise
+    logger.info(
+        "CATALOG_SEARCH provider=TypeTube results=%d elapsed=%.2fs",
+        len(entries), time.perf_counter() - search_started,
+    )
     SEARCH_RESULT_CACHE[cache_key] = (
-        now + SEARCH_RESULT_TTL,
+        time.time() + SEARCH_RESULT_TTL,
+        fetch,
         [dict(entry) for entry in entries],
     )
-    for old_key, (expires, _) in list(SEARCH_RESULT_CACHE.items()):
+    for old_key, (expires, _, _) in list(SEARCH_RESULT_CACHE.items()):
         if expires <= now:
             SEARCH_RESULT_CACHE.pop(old_key, None)
     while len(SEARCH_RESULT_CACHE) > 256:
@@ -296,6 +379,10 @@ async def resolve_official_async(query: str, application) -> dict | None:
 def friendly_error(e: BaseException) -> str:
     msg = ANSI_RE.sub("", str(e)).strip()
     low = msg.lower()
+    if isinstance(e, (TypeTubeFreeQuotaExhausted, TypeTubeOwnerKeyUnavailable)):
+        return "Song downloads are temporarily unavailable. Please try again later."
+    if isinstance(e, urllib.error.HTTPError) and e.code == 403:
+        return "The audio source temporarily refused the download. Please try again."
     if type(e).__module__.startswith("typetube") or any(
         marker in low
         for marker in (
@@ -407,7 +494,7 @@ def _resolve_typetube_track(target: str):
     public_client = create_client(
         endpoint=owner.TYPE_TUBE_ENDPOINT,
         api_key="public",
-        timeout=15,
+        timeout=TYPE_TUBE_RESOLVE_TIMEOUT,
     )
     try:
         return public_client, public_client.resolve(target)
@@ -427,7 +514,7 @@ def _resolve_typetube_track(target: str):
         private_client = create_client(
             endpoint=owner.TYPE_TUBE_ENDPOINT,
             api_key=private_key,
-            timeout=15,
+            timeout=TYPE_TUBE_RESOLVE_TIMEOUT,
         )
         try:
             return private_client, private_client.resolve(target)
@@ -454,6 +541,68 @@ async def _notify_owner_typetube_issue(bot, issue: str, detail: str) -> None:
     _owner_typetube_notices.add(notice_key)
     if len(_owner_typetube_notices) > 64:
         _owner_typetube_notices.clear()
+
+
+def _download_typetube_source(client, track, target: str, source_path: Path):
+    """Download a TypeTube stream, refreshing one expired/denied stream URL."""
+    for attempt in (1, 2):
+        try:
+            if hasattr(os, "pwrite"):
+                result = client.download_audio(
+                    track,
+                    output_path=str(source_path),
+                    workers=8 if attempt == 1 else 4,
+                    chunk_size=4 * 1024 * 1024,
+                )
+                return (
+                    client,
+                    track,
+                    result.bytes_written,
+                    result.average_speed_mbps,
+                )
+
+            request = urllib.request.Request(
+                track.best_audio.url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*",
+                },
+            )
+            bytes_written = 0
+            with urllib.request.urlopen(request, timeout=30) as response:
+                with source_path.open("wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        bytes_written += len(chunk)
+                        if MAX_FILE_MB and bytes_written > MAX_FILE_MB * 1024 * 1024:
+                            raise ValueError(
+                                f"Source audio exceeds the {MAX_FILE_MB} MB limit."
+                            )
+                        output.write(chunk)
+            return client, track, bytes_written, None
+        except Exception as error:
+            status_code = getattr(
+                error, "code", getattr(error, "status_code", None)
+            )
+            if status_code != 403 or attempt == 2:
+                raise
+            logger.warning(
+                "TypeTube stream returned HTTP 403; resolving a fresh stream URL."
+            )
+            refreshed_client, refreshed_track = _resolve_typetube_track(target)
+            if (
+                not refreshed_track.success
+                or not refreshed_track.best_audio
+                or not refreshed_track.best_audio.url
+            ):
+                raise RuntimeError(
+                    "TypeTube could not provide a fresh audio stream after HTTP 403."
+                ) from error
+            source_path.unlink(missing_ok=True)
+            client, track = refreshed_client, refreshed_track
+    raise RuntimeError("TypeTube audio download failed after refreshing the stream.")
 
 
 def download_song_to_ram(
@@ -509,39 +658,13 @@ def download_song_to_ram(
         source_path = Path(tmpdir) / f"{track.id}{source_suffix}"
         mp3_path = Path(tmpdir) / f"{track.id}.mp3"
         download_started = time.perf_counter()
-        if hasattr(os, "pwrite"):
-            download_result = client.download_audio(
-                track,
-                output_path=str(source_path),
-                workers=16,
-                chunk_size=1024 * 1024,
-            )
-            bytes_written = download_result.bytes_written
-            average_speed = download_result.average_speed_mbps
-        else:
-            request = urllib.request.Request(
-                track.best_audio.url,
-                headers={"User-Agent": "Emy Telegram Bot"},
-            )
-            bytes_written = 0
-            with urllib.request.urlopen(request, timeout=30) as response:
-                with source_path.open("wb") as output:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        bytes_written += len(chunk)
-                        if MAX_FILE_MB and bytes_written > MAX_FILE_MB * 1024 * 1024:
-                            raise ValueError(
-                                f"Source audio exceeds the {MAX_FILE_MB} MB limit."
-                            )
-                        output.write(chunk)
+        client, track, bytes_written, average_speed = _download_typetube_source(
+            client, track, target, source_path
+        )
         download_seconds = time.perf_counter() - download_started
         if not source_path.is_file() or source_path.stat().st_size < 1024:
             raise RuntimeError("TypeTube audio download did not produce a file.")
-        if hasattr(os, "pwrite"):
-            average_speed = download_result.average_speed_mbps
-        else:
+        if average_speed is None:
             average_speed = (
                 bytes_written / (1024 * 1024) / max(download_seconds, 0.01)
             )
@@ -1744,12 +1867,15 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         try:
             candidates = await resolve_candidates_async(
-                query, context.application, limit=50
+                    query, context.application, limit=25
             )
         except Exception as error:
             logger.exception("Search failed for query %r", query[:100])
             await search_status.edit_text(
-                error_html("Search failed", friendly_error(error)),
+                error_html(
+                    "Search temporarily unavailable",
+                    "The music catalog could not respond. Please try again.",
+                ),
                 parse_mode="HTML",
             )
             return
