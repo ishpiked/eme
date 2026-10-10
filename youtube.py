@@ -424,6 +424,36 @@ def select_inline_audio_format(formats: list[dict]) -> dict:
     return candidates[0]
 
 
+def select_inline_video_format(
+    formats: list[dict], max_bytes: int = 50 * 1024 * 1024
+) -> dict:
+    candidates = [
+        item for item in formats
+        if item.get("url")
+        and item.get("hasAudio")
+        and item.get("hasVideo")
+        and "video/mp4" in str(item.get("mimeType") or "").lower()
+        and 0 < _integer(item.get("height")) <= 720
+        and (
+            not item.get("contentLength")
+            or _integer(item["contentLength"]) <= max_bytes
+        )
+    ]
+    candidates.sort(
+        key=lambda item: (
+            _integer(item.get("height")),
+            _integer(item.get("bitrate")),
+        ),
+        reverse=True,
+    )
+    if not candidates:
+        raise YouTubeError(
+            "YouTube did not return a direct MP4 video-and-audio stream "
+            "at 720p or lower within the inline size limit."
+        )
+    return candidates[0]
+
+
 def format_extension(stream: dict) -> str:
     mime_type = str(stream.get("mimeType") or "").lower()
     if "mp4" in mime_type or "m4a" in mime_type:

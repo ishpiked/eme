@@ -1,6 +1,8 @@
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -31,6 +33,71 @@ class AudioEffectsTests(unittest.TestCase):
         self.assertIn("aecho=0.92:0.94:22|46|78:0.075|0.045|0.022", graph)
         self.assertIn("volume=0.30[depth]", graph)
         self.assertIn("volume=0.78[direct]", graph)
+
+    def test_phonk_is_deterministic_and_shapes_source_rhythm_without_generated_beats(self):
+        build = emyfx.PRESETS["phonk"]["build"]
+        graph = build(120.0)
+        self.assertEqual(graph, build(120.0))
+        self.assertIn("lowpass=f=150,bass=g=5:f=75", graph)
+        self.assertIn("acompressor=threshold=0.18:ratio=2.8:attack=7:release=90", graph)
+        self.assertIn("asoftclip=type=tanh", graph)
+        self.assertNotIn("anoisesrc", graph)
+        self.assertNotIn("aevalsrc", graph)
+        self.assertNotIn("random(", graph)
+
+    def test_dreamy_has_filtered_spacious_reverb_over_a_clear_dry_signal(self):
+        graph = emyfx.PRESETS["dreamy"]["build"](120.0)
+        self.assertIn("highpass=f=180,lowpass=f=12000", graph)
+        self.assertIn("aecho=0.90:0.94:45|95|180|350|700|1200", graph)
+        self.assertIn("stereowiden=", graph)
+        self.assertIn("[dryw][wet]amix=inputs=2", graph)
+
+
+class EffectRenderLatencyTests(unittest.IsolatedAsyncioTestCase):
+    async def test_duration_probe_is_skipped_when_preset_does_not_use_duration(self):
+        process = SimpleNamespace(
+            communicate=AsyncMock(return_value=(b"", b"")),
+            returncode=0,
+        )
+        with patch.object(
+            emyfx.asyncio, "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ), patch.object(
+            emyfx, "probe_duration", new_callable=AsyncMock
+        ) as probe_duration, patch.object(
+            emyfx, "build_ffmpeg_args", return_value=["ffmpeg"]
+        ):
+            with patch.object(
+                emyfx.Path, "exists", return_value=True
+            ), patch.object(
+                emyfx.Path, "stat",
+                return_value=SimpleNamespace(st_size=1024),
+            ):
+                await emyfx.render_to_path("source.mp3", "output.mp3", "8d")
+
+        probe_duration.assert_not_awaited()
+
+    async def test_duration_dependent_preset_still_probes_source(self):
+        process = SimpleNamespace(
+            communicate=AsyncMock(return_value=(b"", b"")),
+            returncode=0,
+        )
+        with patch.object(
+            emyfx.asyncio, "create_subprocess_exec",
+            AsyncMock(return_value=process),
+        ), patch.object(
+            emyfx, "probe_duration", new_callable=AsyncMock,
+            return_value=120.0,
+        ) as probe_duration, patch.object(
+            emyfx, "build_ffmpeg_args", return_value=["ffmpeg"]
+        ), patch.object(
+            emyfx.Path, "exists", return_value=True
+        ), patch.object(
+            emyfx.Path, "stat", return_value=SimpleNamespace(st_size=1024)
+        ):
+            await emyfx.render_to_path("source.mp3", "output.mp3", "vinyl")
+
+        probe_duration.assert_awaited_once_with("source.mp3")
 
 
 if __name__ == "__main__":

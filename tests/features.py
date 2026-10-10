@@ -7,7 +7,7 @@ import unittest
 import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from telegram.error import BadRequest, TelegramError
 
@@ -134,6 +134,39 @@ class FakeStatusMessage:
 
 
 class TelegramFeatureTests(unittest.IsolatedAsyncioTestCase):
+    def test_local_api_endpoint_configuration_is_validated_and_applied(self):
+        self.assertIsNone(emy_bot.local_api_urls(""))
+        self.assertEqual(
+            emy_bot.local_api_urls("http://127.0.0.1:8081/"),
+            (
+                "http://127.0.0.1:8081/bot",
+                "http://127.0.0.1:8081/file/bot",
+            ),
+        )
+        for invalid_url in (
+            "ftp://127.0.0.1:8081",
+            "http://user:pass@127.0.0.1:8081",
+            "http://127.0.0.1:8081/bot",
+            "http://127.0.0.1:8081?token=secret",
+        ):
+            with self.subTest(invalid_url=invalid_url):
+                with self.assertRaises(ValueError):
+                    emy_bot.local_api_urls(invalid_url)
+
+        builder = Mock()
+        builder.base_url.return_value = builder
+        builder.base_file_url.return_value = builder
+        builder.local_mode.return_value = builder
+        self.assertIs(
+            emy_bot.configure_local_api(builder, "http://127.0.0.1:8081"),
+            builder,
+        )
+        builder.base_url.assert_called_once_with("http://127.0.0.1:8081/bot")
+        builder.base_file_url.assert_called_once_with(
+            "http://127.0.0.1:8081/file/bot"
+        )
+        builder.local_mode.assert_called_once_with(True)
+
     async def test_private_text_is_searched_directly_but_group_text_is_ignored(self):
         bot = FakeSongMenuBot()
         context = SimpleNamespace(bot=bot, application=SimpleNamespace())

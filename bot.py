@@ -32,9 +32,8 @@ from telegram import (
     BotCommandScopeDefault,
     InputFile,
     InputMediaAudio,
-    InlineQueryResultArticle,
     InlineQueryResultAudio,
-    InputTextMessageContent,
+    InlineQueryResultVideo,
     Update,
 )
 from telegram.constants import ChatAction
@@ -55,6 +54,7 @@ import emyfx
 import recognition
 import youtube
 import lrclib
+from transport import configure_local_api, local_api_urls
 from features import (
     CUSTOM_EMOJI_IDS,
     CUSTOM_EMOJI_PACK_NAMES,
@@ -84,6 +84,10 @@ BOT_ABOUT = os.getenv(
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))  # 10 min default
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))  # Telegram bots cap ~50MB
 MP3_QUALITY = os.getenv("MP3_QUALITY", "320")  # user demands max quality: 320k every song
+YTDLP_CONCURRENT_FRAGMENTS = min(
+    16, max(1, int(os.getenv("YTDLP_CONCURRENT_FRAGMENTS", "16")))
+)
+TELEGRAM_LOCAL_API_URL = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip()
 BASE_DIR = Path(__file__).resolve().parent
 BOT_PROFILE_PHOTO = os.getenv("BOT_PROFILE_PHOTO", "").strip()
 BOT_PROFILE_PHOTO_URL = os.getenv(
@@ -100,6 +104,7 @@ logger = logging.getLogger(__name__)
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 MAX_INLINE_QUERY_LENGTH = 256
+INLINE_QUERY_TIMEOUT = 3.0
 
 
 def derive_artist(entry: dict) -> str:
@@ -268,46 +273,118 @@ async def resolve_official_async(query: str, application) -> dict | None:
     return ranked[0] if ranked else None
 
 
-def _result_duration(entry: dict) -> str:
-    try:
-        seconds = int(entry.get("duration") or 0)
-    except (TypeError, ValueError, OverflowError):
-        return ""
-    if not seconds:
-        return ""
-    return f"{seconds // 60}:{seconds % 60:02d}"
+async def resolve_recognition_candidate_async(
+    recognized_song: dict, application
+) -> dict | None:
+    title = str(recognized_song.get("title") or "").strip()
+    artist = str(recognized_song.get("artist") or "").strip()
+    if not title:
+        return None
 
+    queries = [f"{title} {artist}".strip()]
+    candidates = await resolve_candidates_async(
+        queries[0], application, limit=10
+    )
 
-def _inline_song_article(candidate: dict) -> InlineQueryResultArticle:
-    video_id = youtube.get_video_id(str(candidate.get("id") or ""))
-    title, artist = curate_track(
-        str(candidate.get("title") or "Song"),
-        str(candidate.get("artist") or candidate.get("channel") or ""),
-    )
-    details = " · ".join(
-        part for part in (artist, _result_duration(candidate)) if part
-    )
-    thumbnail = candidate.get("thumbnail")
-    if (
-        not isinstance(thumbnail, str)
-        or not thumbnail.startswith("https://")
-        or len(thumbnail) > 2048
+    def rank(entries: list[dict]) -> list[tuple[float, float, float, dict]]:
+        ranked = []
+        for candidate in entries:
+            candidate_title, _ = curate_track(
+                derive_title(candidate), derive_artist(candidate)
+            )
+            title_score = recognition.title_match_ratio(title, candidate_title)
+            artist_score = (
+                recognition.title_match_ratio(artist, derive_artist(candidate))
+                if artist else 0.0
+            )
+            combined = title_score * 0.85 + artist_score * 0.15
+            ranked.append((combined, title_score, artist_score, candidate))
+        return sorted(ranked, key=lambda item: item[:3], reverse=True)
+
+    ranked = rank(candidates)
+    if ranked and (
+        ranked[0][1] >= 0.5
+        or (ranked[0][1] >= 0.35 and ranked[0][2] >= 0.7)
     ):
-        thumbnail = None
-    host = (
-        "music.youtube.com"
-        if recognition.is_music_url(str(candidate.get("url") or ""))
-        else "www.youtube.com"
+        return ranked[0][3]
+
+    title_candidates = await resolve_candidates_async(
+        title, application, limit=10
     )
-    url = f"https://{host}/watch?v={video_id}"
-    return InlineQueryResultArticle(
+    known_ids = {
+        str(candidate.get("id"))
+        for candidate in candidates
+        if isinstance(candidate, dict) and candidate.get("id")
+    }
+    ranked.extend(rank([
+        candidate for candidate in title_candidates
+        if not candidate.get("id") or str(candidate["id"]) not in known_ids
+    ]))
+    ranked.sort(key=lambda item: item[:3], reverse=True)
+    if not ranked:
+        return None
+    best = ranked[0]
+    if best[1] < 0.5 and not (best[1] >= 0.35 and best[2] >= 0.7):
+        return None
+    logger.info(
+        "RECOGNITION_CATALOG_PICK title=%r video_id=%s title_score=%.2f "
+        "artist_score=%.2f",
+        title[:80], best[3].get("id"), best[1], best[2],
+    )
+    return best[3]
+
+
+def _inline_thumbnail(value: object) -> str | None:
+    if (
+        isinstance(value, str)
+        and value.startswith("https://")
+        and len(value) <= 2048
+    ):
+        return value
+    return None
+
+
+def _resolve_inline_audio(candidate: dict) -> InlineQueryResultAudio:
+    video_id = youtube.get_video_id(str(candidate.get("id") or ""))
+    player = youtube.resolve(str(candidate.get("url") or video_id))
+    audio_format = youtube.select_inline_audio_format(player["formats"])
+    title, artist = curate_track(
+        str(player.get("title") or candidate.get("title") or "Song"),
+        str(player.get("author") or candidate.get("artist") or candidate.get("channel") or ""),
+    )
+    return InlineQueryResultAudio(
         id=video_id,
-        title=(f"{title} · {artist}" if artist else title)[:128],
-        description=details[:255] if details else None,
-        thumbnail_url=thumbnail,
-        input_message_content=InputTextMessageContent(
-            f"/play {url} --no-controls"
+        audio_url=audio_format["url"],
+        title=title[:64] or "Song",
+        performer=artist[:64] if artist else None,
+        audio_duration=player.get("duration") or None,
+        thumb_url=_inline_thumbnail(
+            player.get("thumbnail") or candidate.get("thumbnail")
         ),
+    )
+
+
+def _resolve_inline_video(candidate: dict) -> InlineQueryResultVideo:
+    video_id = youtube.get_video_id(str(candidate.get("id") or ""))
+    player = youtube.resolve(str(candidate.get("url") or video_id))
+    video_format = youtube.select_inline_video_format(player["formats"])
+    title, artist = curate_track(
+        str(player.get("title") or candidate.get("title") or "Video"),
+        str(player.get("author") or candidate.get("artist") or candidate.get("channel") or ""),
+    )
+    thumbnail = _inline_thumbnail(
+        player.get("thumbnail") or candidate.get("thumbnail")
+    ) or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg"
+    return InlineQueryResultVideo(
+        id=video_id,
+        video_url=video_format["url"],
+        mime_type="video/mp4",
+        thumb_url=thumbnail,
+        title=title[:128] or "Video",
+        description=artist[:255] if artist else None,
+        video_width=video_format.get("width") or None,
+        video_height=video_format.get("height") or None,
+        video_duration=player.get("duration") or None,
     )
 
 
@@ -320,28 +397,49 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await inline_query.answer([], cache_time=0, is_personal=True)
         return
 
+    deadline = time.monotonic() + INLINE_QUERY_TIMEOUT
+    media_kind = "audio"
+    search_query = query
+    video_search = re.match(r"^(?:/video|video:)\s+(.+)$", query, re.IGNORECASE)
+    if video_search:
+        media_kind = "video"
+        search_query = video_search.group(1).strip()
+
     try:
         if not query:
             candidates = []
-        elif URL_RE.match(query):
-            if not recognition.validate_media_url(query):
+        elif URL_RE.match(search_query):
+            if not recognition.validate_media_url(search_query):
                 candidates = []
             else:
-                video_id = youtube.get_video_id(query)
+                video_id = youtube.get_video_id(search_query)
+                media_kind = (
+                    "audio"
+                    if recognition.is_music_url(search_query)
+                    else "video"
+                )
                 candidates = [{
                     "id": video_id,
-                    "title": "Play YouTube song",
-                    "url": query,
+                    "title": "YouTube video",
+                    "url": search_query,
                 }]
-        elif re.fullmatch(r"[A-Za-z0-9_-]{11}", query):
+        elif re.fullmatch(r"[A-Za-z0-9_-]{11}", search_query):
+            media_kind = "video"
             candidates = [{
-                "id": query,
-                "url": f"https://www.youtube.com/watch?v={query}",
+                "id": search_query,
+                "url": f"https://www.youtube.com/watch?v={search_query}",
             }]
         else:
-            candidates = await resolve_candidates_async(
-                query, context.application, limit=10
-            )
+            try:
+                candidates = await asyncio.wait_for(
+                    resolve_candidates_async(
+                        search_query, context.application, limit=10
+                    ),
+                    timeout=max(0, deadline - time.monotonic()),
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Inline catalog search timed out for %r", query[:80])
+                candidates = []
 
         valid_candidates = []
         seen_ids = set()
@@ -365,16 +463,46 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 ),
             })
 
-        results = []
-        for candidate in valid_candidates[:10]:
+        resolver = (
+            _resolve_inline_video
+            if media_kind == "video"
+            else _resolve_inline_audio
+        )
+
+        async def resolve_candidate(candidate: dict):
             try:
-                results.append(_inline_song_article(candidate))
-            except (TypeError, ValueError, youtube.YouTubeError) as error:
+                return await asyncio.to_thread(resolver, candidate)
+            except Exception as error:
                 logger.info(
-                    "Skipping malformed inline result %s: %s",
+                    "Skipping unresolved inline %s result %s: %s",
+                    media_kind,
                     candidate.get("id"),
                     error,
                 )
+                return None
+
+        tasks = [
+            asyncio.create_task(resolve_candidate(candidate))
+            for candidate in valid_candidates[:10]
+        ]
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=max(0, deadline - time.monotonic()),
+        )
+        results = [
+            task.result()
+            for task in tasks
+            if task in done and not task.cancelled()
+        ]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+            logger.warning(
+                "Inline stream resolution timed out for %d result(s)",
+                len(pending),
+            )
+        results = [result for result in results if result is not None]
     except (recognition.RecognitionError, youtube.YouTubeError, ValueError) as error:
         logger.info("Inline query could not be resolved: %s", error)
         results = []
@@ -547,7 +675,7 @@ def download_song_to_ram(
             "socket_timeout": 20,
             "retries": 3,
             "fragment_retries": 3,
-            "concurrent_fragment_downloads": 8,
+            "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
             "match_filter": duration_filter,
             "progress_hooks": [progress_hook],
             "postprocessors": [{
@@ -1599,14 +1727,8 @@ def fx_menu(
     chat_id: int, msg_id: int, active_effect: str = "off"
 ) -> dict:
     buttons = []
-    for name, label in (
-        ("slowed", "Slowed"),
-        ("8d", "8D"),
-        ("360", "360°"),
-        ("concert", "Concert"),
-        ("vinyl", "Vinyl"),
-        ("lofi", "LoFi"),
-    ):
+    for name, effect in EFFECTS.items():
+        label = effect["label"]
         if name == active_effect:
             buttons.append(custom_button(
                 "Original",
@@ -1619,10 +1741,10 @@ def fx_menu(
                 _cb(chat_id, msg_id, "fx", name),
                 icon_custom_emoji_id=CUSTOM_EMOJI_IDS["audio_effect"],
             ))
+    rows = [buttons[index:index + 3] for index in range(0, len(buttons), 3)]
+    rows.append([custom_button("Back", _cb(chat_id, msg_id, "back", "main"))])
     return inline_keyboard([
-        buttons[:3],
-        buttons[3:],
-        [custom_button("Back", _cb(chat_id, msg_id, "back", "main"))],
+        *rows,
     ])
 
 
@@ -1929,7 +2051,7 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             meta = await download_task
             if recognized_song and recognition.title_match_ratio(
                 recognized_song["title"], meta.get("lyrics_title") or meta["title"]
-            ) < 0.75:
+            ) < 0.5:
                 raise recognition.RecognitionError(
                     "The available track did not match the recognized title closely enough."
                 )
@@ -2412,26 +2534,13 @@ async def _recognize_song_callback(query, context: ContextTypes.DEFAULT_TYPE) ->
             return
 
         recognized_query = f"{match['title']} by {match['artist']}"
-        candidate = await resolve_official_async(recognized_query, context.application)
+        candidate = await resolve_recognition_candidate_async(
+            match, context.application
+        )
         if not candidate or not candidate.get("id"):
             raise recognition.RecognitionError(
-                "The recognized song could not be found in Emy's music catalog."
-            )
-        candidate_title, _ = curate_track(
-            derive_title(candidate), derive_artist(candidate)
-        )
-        if recognition.title_match_ratio(match["title"], candidate_title) < 0.75:
-            raise recognition.RecognitionError(
-                "The catalog result did not match the recognized title closely enough."
-            )
-        provider_artist = candidate.get("artist")
-        if (
-            isinstance(provider_artist, str)
-            and provider_artist.strip()
-            and recognition.title_match_ratio(match["artist"], provider_artist) < 0.5
-        ):
-            raise recognition.RecognitionError(
-                "The catalog artist did not match the recognition result."
+                "A close catalog match could not be found. "
+                "Try recognizing a clearer or longer clip."
             )
 
         if request.get("preview_video") and recognition_status:
@@ -3398,6 +3507,7 @@ BOT_COMMANDS = [
 
 OWNER_COMMANDS = [
     BotCommand("owner", "Open the owner console"),
+    BotCommand("ping", "Measure bot API latency"),
     BotCommand("stats", "Show detailed bot statistics"),
     BotCommand("apikey", "Set the private TypeTube API key"),
     BotCommand("broadcast", "Create a managed broadcast"),
@@ -3405,6 +3515,31 @@ OWNER_COMMANDS = [
     BotCommand("broadcast_cancel", "Cancel a running broadcast"),
     BotCommand("broadcast_resume", "Retry a broadcast"),
 ]
+
+
+async def ping_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.effective_message
+    user = update.effective_user
+    chat = update.effective_chat
+    if (
+        not message
+        or not user
+        or not chat
+        or not OWNER_CONSOLE.owner_id
+        or user.id != OWNER_CONSOLE.owner_id
+        or chat.type != "private"
+    ):
+        return
+
+    started = time.perf_counter()
+    await context.bot.get_me()
+    latency_ms = (time.perf_counter() - started) * 1000
+    await message.reply_text(
+        f"Pong! <code>Latency: {latency_ms:.1f} ms</code>",
+        parse_mode="HTML",
+    )
 
 
 def download_profile_photo_jpeg(url: str) -> bytes:
@@ -3596,16 +3731,26 @@ def main() -> None:
         connect_timeout=60.0,
         read_timeout=180.0,
         write_timeout=180.0,
+        media_write_timeout=180.0,
         pool_timeout=60.0,
     )
-    app = (
+    app_builder = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .request(request)
+        .concurrent_updates(8)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
-        .build()
     )
+    app_builder = configure_local_api(app_builder, TELEGRAM_LOCAL_API_URL)
+    if TELEGRAM_LOCAL_API_URL:
+        logger.info(
+            "Telegram Bot API transport: local server at %s",
+            TELEGRAM_LOCAL_API_URL.rstrip("/"),
+        )
+    else:
+        logger.info("Telegram Bot API transport: hosted Bot API")
+    app = app_builder.build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("stop", OWNER_CONSOLE.stop_broadcasts))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -3616,6 +3761,7 @@ def main() -> None:
     app.add_handler(InlineQueryHandler(inline_search))
     app.add_handler(CommandHandler("playlist", playlist_command))
     app.add_handler(CommandHandler("owner", OWNER_CONSOLE.owner_command))
+    app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("stats", OWNER_CONSOLE.stats_command))
     app.add_handler(CommandHandler("broadcast", OWNER_CONSOLE.begin_broadcast))
     app.add_handler(

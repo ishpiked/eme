@@ -228,6 +228,45 @@ class TestYouTube(unittest.TestCase):
         ]
         self.assertIs(youtube.select_inline_audio_format(formats), selected)
 
+    def test_inline_video_selects_best_bounded_combined_mp4_stream(self):
+        best = {
+            "mimeType": 'video/mp4; codecs="avc1,mp4a"',
+            "url": "https://stream.example/720p",
+            "height": 720,
+            "bitrate": 900000,
+            "contentLength": 20_000_000,
+            "hasAudio": True,
+            "hasVideo": True,
+        }
+        too_large = {
+            **best,
+            "url": "https://stream.example/large",
+            "height": 720,
+            "contentLength": 60_000_000,
+        }
+        formats = [
+            {
+                **best,
+                "url": "https://stream.example/360p",
+                "height": 360,
+                "bitrate": 400000,
+            },
+            too_large,
+            best,
+        ]
+
+        self.assertIs(youtube.select_inline_video_format(formats), best)
+
+    def test_inline_video_rejects_video_without_audio(self):
+        with self.assertRaisesRegex(youtube.YouTubeError, "video-and-audio"):
+            youtube.select_inline_video_format([{
+                "mimeType": "video/mp4",
+                "url": "https://stream.example/video-only",
+                "height": 720,
+                "hasAudio": False,
+                "hasVideo": True,
+            }])
+
     def test_download_format_uses_parallel_ranges(self):
         payload = b"abcdefgh"
         with tempfile.TemporaryDirectory() as temp_dir:

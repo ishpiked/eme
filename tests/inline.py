@@ -42,12 +42,12 @@ class InlineSearchTests(unittest.IsolatedAsyncioTestCase):
         )
         search.assert_not_awaited()
 
-    async def test_video_id_resolves_directly(self):
+    async def test_video_id_resolves_as_inline_video(self):
         update, inline_query = make_update("abcdefghijk")
         result = SimpleNamespace(id="abcdefghijk")
         with patch.object(
             bot,
-            "_resolve_inline_audio",
+            "_resolve_inline_video",
             return_value=result,
         ) as resolver:
             await bot.inline_search(update, SimpleNamespace(application=object()))
@@ -60,30 +60,67 @@ class InlineSearchTests(unittest.IsolatedAsyncioTestCase):
             [result], cache_time=0, is_personal=True
         )
 
-    async def test_youtube_url_preserves_music_host(self):
-        for query in (
-            "https://youtu.be/abcdefghijk?t=4",
-            "https://www.youtube.com/shorts/abcdefghijk",
-            "https://music.youtube.com/watch?v=abcdefghijk&list=PL123",
-        ):
-            with self.subTest(query=query):
-                update, inline_query = make_update(query)
-                result = SimpleNamespace(id="abcdefghijk")
-                with patch.object(
-                    bot,
-                    "_resolve_inline_audio",
-                    return_value=result,
-                ) as resolver:
-                    await bot.inline_search(
-                        update, SimpleNamespace(application=object())
-                    )
+    async def test_youtube_video_url_resolves_as_inline_video(self):
+        query = "https://youtu.be/abcdefghijk?t=4"
+        update, inline_query = make_update(query)
+        result = SimpleNamespace(id="abcdefghijk")
+        with patch.object(
+            bot, "_resolve_inline_video", return_value=result
+        ) as resolver:
+            await bot.inline_search(update, SimpleNamespace(application=object()))
 
-                candidate = resolver.call_args.args[0]
-                self.assertEqual(candidate["id"], "abcdefghijk")
-                self.assertEqual(candidate["url"], query)
-                inline_query.answer.assert_awaited_once_with(
-                    [result], cache_time=0, is_personal=True
-                )
+        candidate = resolver.call_args.args[0]
+        self.assertEqual(candidate["id"], "abcdefghijk")
+        self.assertEqual(
+            candidate["url"],
+            "https://www.youtube.com/watch?v=abcdefghijk",
+        )
+        inline_query.answer.assert_awaited_once_with(
+            [result], cache_time=0, is_personal=True
+        )
+
+    async def test_youtube_music_url_resolves_as_inline_audio(self):
+        query = "https://music.youtube.com/watch?v=abcdefghijk&list=PL123"
+        update, inline_query = make_update(query)
+        result = SimpleNamespace(id="abcdefghijk")
+        with patch.object(
+            bot, "_resolve_inline_audio", return_value=result
+        ) as resolver:
+            await bot.inline_search(update, SimpleNamespace(application=object()))
+
+        candidate = resolver.call_args.args[0]
+        self.assertEqual(candidate["id"], "abcdefghijk")
+        self.assertEqual(
+            candidate["url"],
+            "https://music.youtube.com/watch?v=abcdefghijk",
+        )
+        inline_query.answer.assert_awaited_once_with(
+            [result], cache_time=0, is_personal=True
+        )
+
+    async def test_video_search_prefix_returns_video_results(self):
+        update, inline_query = make_update("video: song name")
+        candidate = {"id": "abcdefghijk"}
+        result = SimpleNamespace(id="abcdefghijk")
+        with (
+            patch.object(
+                bot,
+                "resolve_candidates_async",
+                new=AsyncMock(return_value=[candidate]),
+            ) as search,
+            patch.object(
+                bot,
+                "_resolve_inline_video",
+                return_value=result,
+            ) as resolver,
+        ):
+            await bot.inline_search(update, SimpleNamespace(application=object()))
+
+        search.assert_awaited_once_with("song name", ANY, limit=10)
+        resolver.assert_called_once()
+        inline_query.answer.assert_awaited_once_with(
+            [result], cache_time=0, is_personal=True
+        )
 
     async def test_search_filters_bad_ids_duplicates_and_limits_results(self):
         candidates = [
@@ -197,6 +234,40 @@ class InlineSearchTests(unittest.IsolatedAsyncioTestCase):
             result.thumb_url,
             player_result["thumbnail"],
         )
+
+    def test_resolver_returns_direct_inline_video(self):
+        candidate = {
+            "id": "abcdefghijk",
+            "url": "https://www.youtube.com/watch?v=abcdefghijk",
+            "title": "Fallback",
+        }
+        player_result = {
+            "id": "abcdefghijk",
+            "title": "Song",
+            "author": "Artist",
+            "duration": 183,
+            "thumbnail": "https://i.ytimg.com/vi/abcdefghijk/default.jpg",
+            "formats": [{"url": "https://stream.example/video"}],
+        }
+        video_format = {
+            "url": "https://stream.example/video",
+            "width": 1280,
+            "height": 720,
+        }
+        with (
+            patch.object(bot.youtube, "resolve", return_value=player_result),
+            patch.object(
+                bot.youtube,
+                "select_inline_video_format",
+                return_value=video_format,
+            ),
+        ):
+            result = bot._resolve_inline_video(candidate)
+
+        self.assertIsInstance(result, bot.InlineQueryResultVideo)
+        self.assertEqual(result.video_url, video_format["url"])
+        self.assertEqual(result.video_width, 1280)
+        self.assertEqual(result.video_height, 720)
 
 
 if __name__ == "__main__":

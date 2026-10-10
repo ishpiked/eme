@@ -4,7 +4,7 @@ Search and play songs by name, or identify music from public YouTube links. YouT
 
 Selecting a search result starts a fresh YouTube stream resolution and audio download. YouTube links sent as messages keep the separate video-preview and **Recognize Song** flow.
 
-Telegram inline mode (`@botname song`) searches YouTube and resolves up to five fresh, direct MP4 audio URLs concurrently. Telegram fetches the selected source directly, so inline playback skips the bot's download, 320 kbps MP3 conversion, and upload; source bitrate is whatever YouTube provides, and playback depends on Telegram being able to fetch the signed URL before it expires. Text search selections and YouTube Music links use the full MP3 pipeline.
+Telegram inline mode (`@botname song`) shows up to ten audio results. Selecting one makes Telegram fetch the fresh direct audio stream and post it in the chat; this skips the bot's download, 320 kbps MP3 conversion, and upload, so inline audio uses the source bitrate provided by YouTube. Use `@botname video: song name` for up to ten matching MP4 videos (720p maximum), paste a YouTube video URL or ID for a video result, or paste a YouTube Music URL for audio. Inline stream URLs are short-lived and depend on Telegram being able to fetch them. Inline queries are time-bounded to keep responses fast; results that do not resolve in time are omitted.
 
 ## Commands
 - `/start`, `/help`: welcome message
@@ -29,6 +29,7 @@ Playlists are available to every user in a private chat; they are not owner-only
    Copy-Item .env.example .env
    # set BOT_TOKEN and your numeric Telegram BOT_OWNER_ID
    ```
+   For an optional same-VPS Bot API hop, run the official [Telegram Local Bot API server](https://core.telegram.org/bots/api#using-a-local-bot-api-server), then set `TELEGRAM_LOCAL_API_URL=http://127.0.0.1:8081` in `.env`. Keep the service bound to loopback or a trusted private interface; do not expose its port publicly. This may reduce client-to-API overhead, but cannot guarantee the VPS-to-Telegram network route's throughput.
 5. Run:
    ```powershell
    python bot.py
@@ -44,6 +45,7 @@ Playlists are available to every user in a private chat; they are not owner-only
 | `BOT_PROFILE_PHOTO` | none | Optional local JPEG file for the bot profile photo |
 | `MAX_DURATION_SEC` | `600` | Reject songs longer than this (also saves RAM) |
 | `MAX_FILE_MB` | `49` | Telegram Bot API ~50MB limit (also RAM cap) |
+| `TELEGRAM_LOCAL_API_URL` | unset | Optional Local Bot API server origin, e.g. `http://127.0.0.1:8081` |
 | `BOT_DATA_DIR` | OS user config directory | Private storage for bot state |
 | `BOT_DATABASE_FILE` | `<BOT_DATA_DIR>/bot-state.sqlite3` | Optional user, playlist, and broadcast database override |
 
@@ -57,14 +59,16 @@ Playlists are available to every user in a private chat; they are not owner-only
 - Telegram inline mode uses the player's direct audio-only MP4 streams for text searches, YouTube links, and 11-character video IDs. Telegram fetches the signed YouTube URL itself rather than sending the audio through the bot; the available quality is whatever YouTube exposes, and a signed URL may expire or be inaccessible to Telegram. Enable inline mode with BotFather's `/setinline`. Inline answers are not cached.
 
 ### Audio effects and transfer timings
-- The Effect menu and `/settings` use the FFmpeg presets in `emyfx.py`: 8D, 360°, 3D, Concert, Slowed, Vinyl, and LoFi. 360° adds a slower stereo orbit; 3D adds soft depth and short reflections while keeping bass centred. Headphones are recommended for spatial effects.
+- The Effect menu and `/settings` use the FFmpeg presets in `emyfx.py`: 8D, 360°, 3D, Concert, Slowed, Vinyl, LoFi, Phonk, and Dreamy. Phonk shapes the source's bass and transients with controlled saturation; it does not generate or randomize beats. Dreamy adds filtered, spacious reflections over the original signal. Headphones are recommended for spatial effects.
 - Changing a song's name, artist, cover, or effect replaces the media on the existing Telegram message. Effects always render from the untouched source audio; choosing another preset never layers effects, and the active preset's button becomes **Original** to restore the unprocessed track.
 - Song search requests up to 25 YouTube results in a background thread; search results are cached in memory for five minutes, including partial result sets, so repeat searches do not refetch just because fewer than the requested maximum were available.
 - The bot logs catalog search, yt-dlp download/MP3 postprocessing, effect rendering, Telegram upload request and stage duration, effective payload rate, and total request time when the corresponding phase occurs. Initial playback still depends on catalog/provider response time, file size, and Telegram's upload/processing speed; no bot can guarantee a fixed 2–3 second upload for a full-length track.
+- The bot processes up to eight Telegram updates concurrently so a long download or effect render does not hold up unrelated messages and button callbacks. Effect presets that do not use source duration skip the extra FFprobe subprocess; Vinyl and LoFi retain the duration probe required to size their texture sources.
+- `YTDLP_CONCURRENT_FRAGMENTS` controls yt-dlp's bounded fragment-download concurrency (default 16, maximum 16). It can help segmented media when the server/network supports parallel fragments, but does not accelerate progressive single-stream downloads or Telegram uploads. Use the transfer benchmark below to identify the actual bottleneck; VPS bandwidth alone cannot guarantee Telegram throughput.
 - Telegram's Bot API returns only after it has accepted and processed an upload; it does not expose a separate server processing duration. The logged request duration therefore includes both network transfer and Telegram processing and must not be interpreted as client side upload time alone.
 - YouTube's public results page supplies search results. yt-dlp handles song downloads and MP3 extraction; the player endpoint is still used by inline audio, previews, and recognition, which require direct stream URLs.
 - The bot reuses its configured `HTTPXRequest` connection pool for Telegram API calls.
-- To measure Telegram transfer performance independently of YouTube search and FFmpeg, set `BENCHMARK_CHAT_ID` to a chat where the bot can send messages, then run `python benchmark_transfers.py`. It sends and deletes synthetic 1, 5, 10, and 15 MB documents (decimal), verifies their SHA-256 hashes, and logs upload/download times and effective throughput. It does not report server-processing time separately because Telegram does not expose that measurement.
+- To measure Telegram transfer performance independently of YouTube search and FFmpeg, set `BENCHMARK_CHAT_ID` to a chat where the bot can send messages, then run `python transfer.py`. It sends and deletes synthetic 1, 5, 10, and 15 MB documents (decimal), verifies their SHA-256 hashes, and logs upload/download times and effective throughput. It uses `TELEGRAM_LOCAL_API_URL` when configured. Timings include Bot API processing because Telegram does not expose the raw network-transfer interval.
 
 ### Telegram rich-message support
 - `telegram_features.py` wraps the current Bot API rich message, rich draft, text draft, and ephemeral message methods using PTB's pooled request client. Rich-message payloads use Telegram's `InputRichMessage` schema, including its supported text entities and content blocks.

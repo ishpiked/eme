@@ -168,6 +168,38 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(recognition.title_match_ratio("Na Jaane", "Other Song"), 0.0)
         self.assertEqual(recognition.title_match_ratio("Hello", "Hello"), 1.0)
+        self.assertEqual(recognition.title_match_ratio("A", "A"), 1.0)
+        self.assertEqual(recognition.title_match_ratio("A", "Another Song"), 0.0)
+        self.assertGreaterEqual(
+            recognition.title_match_ratio("Chandlier", "Chandelier"),
+            0.75,
+        )
+
+    async def test_recognition_search_ranks_beyond_the_first_catalog_hit(self):
+        wrong = {
+            "id": "wrongvideo01",
+            "title": "Unrelated Track",
+            "artist": "Another Artist",
+        }
+        match = {
+            "title": "Na Jaane",
+            "artist": "Neeraj Shridhar",
+        }
+        correct = {
+            "id": "correctvid01",
+            "title": "Na Jaane (Official Audio)",
+            "artist": "Neeraj Shridhar",
+        }
+        with patch.object(
+            emy_bot,
+            "resolve_candidates_async",
+            new=AsyncMock(return_value=[wrong, correct]),
+        ):
+            selected = await emy_bot.resolve_recognition_candidate_async(
+                match, SimpleNamespace()
+            )
+
+        self.assertIs(selected, correct)
 
     async def test_shazam_recognition_does_not_require_credentials(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -307,7 +339,7 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
                 update, SimpleNamespace(application=application)
             )
 
-        search.assert_awaited_once_with("song name", application, limit=5)
+        search.assert_awaited_once_with("song name", application, limit=10)
         resolve.assert_called_once_with(candidates[0])
         query.answer.assert_awaited_once_with(
             [result], cache_time=0, is_personal=True
@@ -460,7 +492,7 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
             }),
         ), patch.object(
             emy_bot,
-            "resolve_official_async",
+            "resolve_recognition_candidate_async",
             new=AsyncMock(return_value=candidate),
         ), patch.object(
             emy_bot,

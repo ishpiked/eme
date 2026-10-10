@@ -9,6 +9,8 @@ Every preset is a single `-filter_complex` graph rendered in one ffmpeg pass
   slowed  slowed + reverb (0.85x, natural pitch drop, -14 LUFS / -1 dBTP)
   vinyl   warm record player: crackle, hiss, wow/flutter, gentle saturation
   lofi    dusty mellow: 22.05 kHz band-limit, ~13-bit quantisation, tape hiss
+  phonk   source-rhythm bass shaping, controlled saturation and punch
+  dreamy  filtered soft reflections and a spacious stereo image
 
 Design rules encoded here (from the preset spec):
 
@@ -149,6 +151,38 @@ def _graph_3d(duration: float | None) -> str:
     )
 
 
+def _graph_phonk(duration: float | None) -> str:
+    """Phonk: deterministic low-end weight and saturated, punchy upper band."""
+    del duration
+    return (
+        f"[0:a]{_STEREO},asplit=3[body][basssrc][drumssrc];"
+        "[body]volume=0.72[main];"
+        "[basssrc]lowpass=f=150,bass=g=5:f=75,"
+        "asoftclip=type=tanh:param=1.4:oversample=2,volume=0.58[bass];"
+        "[drumssrc]highpass=f=150,"
+        "acompressor=threshold=0.18:ratio=2.8:attack=7:release=90,"
+        "asoftclip=type=tanh:param=1.8:oversample=2,volume=0.24[drums];"
+        "[main][bass][drums]amix=inputs=3:normalize=0:duration=first,"
+        f"{_SAFE_TAIL}[out]"
+    )
+
+
+def _graph_dreamy(duration: float | None) -> str:
+    """Dreamy: restrained, filtered reflections over a clear direct signal."""
+    del duration
+    return (
+        f"[0:a]{_STEREO},asplit=2[dry][air];"
+        "[dry]volume=0.88[dryw];"
+        "[air]highpass=f=180,lowpass=f=12000,"
+        "aecho=0.90:0.94:45|95|180|350|700|1200:"
+        "0.18|0.14|0.10|0.08|0.05|0.03,"
+        "stereowiden=delay=16:feedback=0.20:crossfeed=0.24:drymix=0.80,"
+        "extrastereo=m=1.14,volume=0.28[wet];"
+        "[dryw][wet]amix=inputs=2:normalize=0:duration=first,"
+        f"{_SAFE_TAIL}[out]"
+    )
+
+
 def _graph_concert(duration: float | None, decay_s: float = 2.5) -> str:
     """Concert hall: a clear early-reflection bloom and a soft, wide decay."""
     del decay_s  # decay length is encoded in _DECAY_TAPS_MS
@@ -268,6 +302,21 @@ PRESETS: dict = {
         "notes": "gentle depth, short early reflections, soft width and centred bass",
         "headphones": True,
     },
+    "phonk": {
+        "key": "phonk",
+        "label": "Phonk",
+        "suffix": "(Phonk)",
+        "build": _graph_phonk,
+        "notes": "shaped bass, controlled saturation and punch from the source rhythm",
+    },
+    "dreamy": {
+        "key": "dreamy",
+        "label": "Dreamy",
+        "suffix": "(Dreamy)",
+        "build": _graph_dreamy,
+        "notes": "soft filtered reverb, airy highs and a spacious stereo image",
+        "headphones": True,
+    },
     "concert": {
         "key": "concert",
         "label": "Concert",
@@ -287,6 +336,7 @@ PRESETS: dict = {
         "label": "Vinyl",
         "suffix": "(Vinyl)",
         "build": _graph_vinyl,
+        "requires_duration": True,
         "notes": "surface crackle, warm rolloff, gentle wow/flutter and hiss",
     },
     "lofi": {
@@ -294,6 +344,7 @@ PRESETS: dict = {
         "label": "LoFi",
         "suffix": "(LoFi)",
         "build": _graph_lofi,
+        "requires_duration": True,
         "notes": "soft 12-bit grain, softened top end, tape hiss and motion",
     },
 }
@@ -374,7 +425,7 @@ async def render_to_path(
 
     if effect not in PRESETS:
         raise KeyError(f"unknown effect: {effect!r}")
-    if duration is None:
+    if duration is None and PRESETS[effect].get("requires_duration", False):
         duration = await probe_duration(src)
     argv = build_ffmpeg_args(src, out, effect, duration=duration, bitrate=bitrate)
     t0 = time.perf_counter()

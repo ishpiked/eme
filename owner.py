@@ -425,30 +425,31 @@ class OwnerConsole:
                 GROUP BY b.id ORDER BY b.id DESC LIMIT 5
                 """
             ).fetchall()
-        recent_text = (
-            "\n".join(
-                f"• #{row['id']} — <b>{row['status']}</b>: "
-                f"{row['sent'] or 0} sent, "
-                f"{row['failed'] or 0} failed or unreachable, "
-                f"{row['pending'] or 0} pending"
-                for row in recent
-            )
-            if recent else "No recent broadcasts to display."
+        latest_text = (
+            f"The latest broadcast is number {recent[0]['id']}, marked as "
+            f"{escape(recent[0]['status'])}, with {recent[0]['sent'] or 0} "
+            f"delivered, {recent[0]['failed'] or 0} failed and "
+            f"{recent[0]['pending'] or 0} pending."
+            if recent else "The bot has not initiated a broadcast yet."
         )
+        user_word = "user" if total == 1 else "users"
+        reachable_word = "user" if active == 1 else "users"
+        unreachable_word = "user" if unreachable == 1 else "users"
+        broadcast_word = "broadcast" if broadcasts == 1 else "broadcasts"
         return (
             '<tg-emoji emoji-id="5258330865674494479">📊</tg-emoji> '
             "<b>Bot Statistics</b>\n\n"
-            f"<b>Known private users:</b> {total}\n"
-            f"<b>Active recipients:</b> {active}\n"
-            f"<b>Inactive</b> (opted out or unreachable): {unreachable}\n"
-            f"<b>Active users</b> (24h / 7d / 30d): "
-            f"{seen_day or 0} / {seen_week or 0} / {seen_month or 0}\n"
-            f"<b>First recorded</b> (24h / 7d / 30d): "
-            f"{joined_today or 0} / {joined_week or 0} / {joined_month or 0}\n\n"
-            f"<b>Broadcasts:</b> {broadcasts}\n"
-            f"<b>Successful deliveries:</b> {total_sent or 0}\n"
-            f"<b>Failed or unreachable deliveries:</b> {total_failed or 0}\n\n"
-            f"<b>Recent broadcasts</b>\n{recent_text}"
+            f"The bot has {total} registered {user_word}, with {active} reachable "
+            f"{reachable_word} and {unreachable} inactive or unreachable "
+            f"{unreachable_word}. "
+            f"User activity in the last 24 hours, 7 days and 30 days stands at "
+            f"{seen_day or 0}, {seen_week or 0} and {seen_month or 0} respectively. "
+            f"New users recorded during the same periods are {joined_today or 0}, "
+            f"{joined_week or 0} and {joined_month or 0}.\n\n"
+            f"The bot has initiated {broadcasts} {broadcast_word}, with "
+            f"{total_sent or 0} successful deliveries and "
+            f"{total_failed or 0} failed deliveries.\n\n"
+            f"{latest_text}"
         )
 
     async def begin_broadcast(
@@ -1537,13 +1538,14 @@ class OwnerConsole:
             ).fetchall()
         if not rows:
             return "<b>Broadcast status</b>\n\nNo broadcasts have been run.", None
-        text_lines = ["<b>Recent broadcasts</b>\n"]
+        text_lines = ["<b>Recent Broadcasts</b>\n"]
         action_rows = []
         for row in rows:
             text_lines.append(
-                f"#{row['id']} · <b>{escape(row['status'])}</b> — "
+                f"Broadcast {row['id']} is {escape(row['status'])}, with "
                 f"{row['sent'] or 0} sent, {row['failed'] or 0} failed, "
-                f"{row['blocked'] or 0} unreachable, {row['pending'] or 0} pending"
+                f"{row['blocked'] or 0} unreachable and "
+                f"{row['pending'] or 0} pending."
             )
             if row["status"] in ("running", "queued"):
                 action_rows.append([

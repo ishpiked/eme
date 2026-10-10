@@ -1,6 +1,7 @@
 """Bounded audio extraction and Shazam-based song recognition helpers."""
 
 import asyncio
+from difflib import SequenceMatcher
 import logging
 import re
 import subprocess
@@ -220,14 +221,29 @@ async def recognize_sample(sample_path: Path) -> dict | None:
 
 
 def title_match_ratio(recognized_title: str, candidate_title: str) -> float:
-    def words(value: str) -> set[str]:
-        return {
-            word for word in re.findall(r"[^\W_]+", value.casefold())
-            if len(word) > 1
-        }
+    def normalize(value: str) -> str:
+        return " ".join(re.findall(r"[^\W_]+", value.casefold()))
 
-    expected = words(recognized_title)
-    candidate = words(candidate_title)
+    expected_text = normalize(recognized_title)
+    candidate_text = normalize(candidate_title)
+    if not expected_text or not candidate_text:
+        return 0.0
+    if expected_text == candidate_text:
+        return 1.0
+
+    expected = set(expected_text.split())
+    candidate = set(candidate_text.split())
+    if expected.issubset(candidate):
+        return 1.0
     if not expected or not candidate:
         return 0.0
-    return len(expected & candidate) / len(expected)
+    word_overlap = len(expected & candidate) / len(expected)
+    length_tolerance = max(2, int(len(expected_text) * 0.25))
+    text_similarity = 0.0
+    if abs(len(expected_text) - len(candidate_text)) <= length_tolerance:
+        text_similarity = SequenceMatcher(
+            None, expected_text, candidate_text
+        ).ratio()
+        if text_similarity < 0.75:
+            text_similarity = 0.0
+    return max(word_overlap, text_similarity)

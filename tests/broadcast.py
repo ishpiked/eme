@@ -2,6 +2,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -46,6 +47,48 @@ class OwnerBroadcastTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(await self.console._require_owner_private(update))
         message.reply_text.assert_not_awaited()
+
+    async def test_statistics_and_recent_broadcasts_include_delivery_counts(self):
+        now = datetime.now(timezone.utc).isoformat()
+        with self.console._connect() as db:
+            db.executemany(
+                "INSERT INTO users "
+                "(user_id, first_seen, last_seen, active) VALUES (?, ?, ?, ?)",
+                [
+                    (1, now, now, 1),
+                    (2, now, now, 0),
+                ],
+            )
+            db.execute(
+                "INSERT INTO broadcasts "
+                "(id, created_at, status, source_chat_id, source_message_id) "
+                "VALUES (1, ?, 'completed', 123, 10)",
+                (now,),
+            )
+            db.executemany(
+                "INSERT INTO broadcast_recipients "
+                "(broadcast_id, user_id, status) VALUES (1, ?, ?)",
+                [(1, "sent"), (2, "blocked"), (3, "pending")],
+            )
+
+        stats = await self.console._stats_text()
+        self.assertIn(
+            "The bot has 2 registered users, with 1 reachable user "
+            "and 1 inactive or unreachable user.",
+            stats,
+        )
+        self.assertIn(
+            "The latest broadcast is number 1, marked as completed, "
+            "with 1 delivered, 1 failed and 1 pending.",
+            stats,
+        )
+
+        recent, _ = self.console._broadcast_status_view()
+        self.assertIn(
+            "Broadcast 1 is completed, with 1 sent, 0 failed, "
+            "1 unreachable and 1 pending.",
+            recent,
+        )
 
     async def test_text_broadcast_persists_buttons_and_custom_emoji(self):
         button_rows = [[{
