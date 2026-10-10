@@ -31,8 +31,7 @@ from telegram import (
     BotCommandScopeDefault,
     InputFile,
     InputMediaAudio,
-    InlineQueryResultArticle,
-    InputTextMessageContent,
+    InlineQueryResultAudio,
     Update,
 )
 from telegram.constants import ChatAction
@@ -1049,92 +1048,130 @@ def parse_song_args(args: list[str]) -> tuple[str, bool]:
 
 
 def _resolve_inline_audio(entry: dict) -> InlineQueryResultAudio:
-    video_id = str(entry["id"])
-    track = youtube.resolve(video_id)
+    video_id = youtube.get_video_id(str(entry.get("id") or ""))
+    candidate_url = str(entry.get("url") or "")
+    if (
+        recognition.validate_media_url(candidate_url)
+        and youtube.get_video_id(candidate_url) == video_id
+    ):
+        target = candidate_url
+    else:
+        target = f"https://www.youtube.com/watch?v={video_id}"
+
+    track = youtube.resolve(target)
     audio = youtube.select_inline_audio_format(track["formats"])
     title, artist = curate_track(
         str(track.get("title") or entry.get("title") or "Unknown"),
-        str(track.get("author") or entry.get("channel") or ""),
+        str(
+            track.get("author")
+            or entry.get("artist")
+            or entry.get("channel")
+            or ""
+        ),
     )
-    duration = int(track.get("duration") or entry.get("duration") or 0)
+    try:
+        duration = int(track.get("duration") or entry.get("duration") or 0)
+    except (TypeError, ValueError, OverflowError):
+        duration = 0
+    thumbnail = track.get("thumbnail") or entry.get("thumbnail")
+    if (
+        not isinstance(thumbnail, str)
+        or not thumbnail.startswith("https://")
+        or len(thumbnail) > 2048
+    ):
+        thumbnail = None
     return InlineQueryResultAudio(
         id=video_id,
         audio_url=audio["url"],
         title=title[:64],
         performer=artist[:64] if artist else None,
         audio_duration=duration or None,
-        thumb_url=track.get("thumbnail") or entry.get("thumbnail"),
+        thumb_url=thumbnail,
     )
 
 
 async def _inline_link_answer(inline_query, url: str) -> None:
     """Offer a pasted YouTube link as a playable inline audio result."""
     if not recognition.validate_media_url(url):
-        await inline_query.answer([], cache_time=15, is_personal=True)
+        await inline_query.answer([], cache_time=0, is_personal=True)
         return
     video_id = youtube.get_video_id(url)
-    result = await asyncio.to_thread(
-        _resolve_inline_audio,
-        {"id": video_id},
+    await _answer_inline_candidates(
+        inline_query,
+        [{"id": video_id, "url": url}],
     )
-    await inline_query.answer(
-        [result],
-        cache_time=0,
-        is_personal=True,
+
+
+async def _answer_inline_candidates(inline_query, candidates: object) -> None:
+    entries = candidates if isinstance(candidates, (list, tuple)) else []
+    normalized = []
+    seen_ids = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            video_id = youtube.get_video_id(str(entry.get("id") or ""))
+        except youtube.YouTubeError:
+            continue
+        if video_id in seen_ids:
+            continue
+        seen_ids.add(video_id)
+        normalized.append({**entry, "id": video_id})
+        if len(normalized) >= 5:
+            break
+
+    resolved = await asyncio.gather(
+        *(
+            asyncio.to_thread(_resolve_inline_audio, entry)
+            for entry in normalized
+        ),
+        return_exceptions=True,
     )
+    results = []
+    for entry, result in zip(normalized, resolved):
+        if isinstance(result, Exception):
+            logger.info(
+                "Could not resolve inline audio for %s (%s).",
+                entry["id"],
+                type(result).__name__,
+            )
+            continue
+        results.append(result)
+    await inline_query.answer(results, cache_time=0, is_personal=True)
 
 
 async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     inline_query = update.inline_query
     if not inline_query:
         return
-    if inline_query.from_user and (
-        getattr(inline_query.from_user, "is_bot", False)
-        or inline_query.from_user.id == getattr(context.bot, "id", None)
-    ):
+    query = str(inline_query.query or "").strip()
+    if len(query) > MAX_INLINE_QUERY_LENGTH:
+        await inline_query.answer([], cache_time=0, is_personal=True)
         return
-    query = (inline_query.query or "").strip()
     if not query:
         await inline_query.answer([], cache_time=5, is_personal=True)
         return
-    if URL_RE.match(query):
-        try:
-            await _inline_link_answer(inline_query, query)
-        except Exception:
-            logger.exception("Inline link preview failed for %r", query[:80])
-            await inline_query.answer([], cache_time=3, is_personal=True)
-        return
 
     try:
+        if URL_RE.match(query):
+            await _inline_link_answer(inline_query, query)
+            return
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", query):
+            await _answer_inline_candidates(
+                inline_query,
+                [{
+                    "id": query,
+                    "url": f"https://www.youtube.com/watch?v={query}",
+                }],
+            )
+            return
         candidates = await resolve_candidates_async(
-            query, context.application, limit=5
+            query, context.application, limit=10
         )
-        candidates = [entry for entry in candidates if entry.get("id")][:5]
-        resolved = await asyncio.gather(
-            *(
-                asyncio.to_thread(_resolve_inline_audio, entry)
-                for entry in candidates
-            ),
-            return_exceptions=True,
-        )
-        results = []
-        for entry, result in zip(candidates, resolved):
-            if isinstance(result, Exception):
-                logger.warning(
-                    "Could not resolve inline audio for %s: %s",
-                    entry.get("id"),
-                    result,
-                )
-                continue
-            results.append(result)
-        await inline_query.answer(
-            results,
-            cache_time=0,
-            is_personal=True,
-        )
+        await _answer_inline_candidates(inline_query, candidates)
     except Exception:
         logger.exception("Inline song search failed for %r", query)
-        await inline_query.answer([], cache_time=3, is_personal=True)
+        await inline_query.answer([], cache_time=0, is_personal=True)
 
 
 def _no_dashes(text: str) -> str:
