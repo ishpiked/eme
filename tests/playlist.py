@@ -108,8 +108,8 @@ class OwnerConsoleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(self.console.list_playlists(10)[0]["song_count"], 1)
         self.assertEqual(
-            self.console.list_playlist_songs(10, playlist_id)[0]["file_id"],
-            "telegram-file-id",
+            self.console.list_playlist_songs(10, playlist_id)[0]["video_id"],
+            "video123",
         )
         self.assertEqual(self.console.list_playlists(11), [])
         self.assertIsNone(self.console.get_playlist(11, playlist_id))
@@ -135,8 +135,8 @@ class OwnerConsoleTests(unittest.IsolatedAsyncioTestCase):
             10, playlist_id
         )[1]["id"]
         self.assertEqual(
-            self.console.get_playlist_song(10, saved_song_id)["file_id"],
-            "effect-file",
+            self.console.get_playlist_song(10, saved_song_id)["video_id"],
+            "video123",
         )
         self.assertTrue(self.console.delete_playlist(10, playlist_id))
         self.assertEqual(self.console.list_playlists(10), [])

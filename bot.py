@@ -51,7 +51,7 @@ from telegram.request import HTTPXRequest
 
 import emyfx
 import recognition
-import ytmusic
+import youtube
 import lrclib
 from features import (
     CUSTOM_EMOJI_IDS,
@@ -82,52 +82,12 @@ BOT_ABOUT = os.getenv(
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))  # 10 min default
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))  # Telegram bots cap ~50MB
 MP3_QUALITY = os.getenv("MP3_QUALITY", "320")  # user demands max quality: 320k every song
-CACHE_FILE = Path(os.getenv("CACHE_FILE", "cache.json"))  # video_id -> telegram file_id (instant resends)
-LEGACY_CACHE_FILE = CACHE_FILE.with_name("songs_cache.json")
 BASE_DIR = Path(__file__).resolve().parent
 BOT_PROFILE_PHOTO = os.getenv("BOT_PROFILE_PHOTO", "").strip()
 BOT_PROFILE_PHOTO_URL = os.getenv(
     "BOT_PROFILE_PHOTO_URL",
     "https://imagehost-pearl.vercel.app/i/0e2ddf9f30ba.png",
 ).strip()
-
-# In-memory file_id cache (backed by CACHE_FILE JSON for restarts).
-# Repeat requests skip YouTube+ffmpeg+upload entirely -> 300-500ms.
-FILE_ID_CACHE: dict = {}
-cache_source = CACHE_FILE if CACHE_FILE.exists() else LEGACY_CACHE_FILE
-if cache_source.exists():
-    try:
-        FILE_ID_CACHE = json.loads(cache_source.read_text(encoding="utf-8"))
-    except Exception:
-        FILE_ID_CACHE = {}
-    else:
-        if cache_source != CACHE_FILE:
-            try:
-                cache_source.replace(CACHE_FILE)
-            except OSError as error:
-                logging.getLogger(__name__).warning(
-                    "Could not migrate cache data to %s: %s", CACHE_FILE, error
-                )
-
-
-def cache_lookup(key: str) -> dict | None:
-    hit = FILE_ID_CACHE.get(key)
-    if hit:
-        return hit
-    # fuzzy: match by normalized query string too
-    norm = key.strip().lower()
-    for k, v in FILE_ID_CACHE.items():
-        if isinstance(v, dict) and v.get("query", "").strip().lower() == norm:
-            return v
-    return None
-
-
-def cache_store(key: str, entry: dict) -> None:
-    FILE_ID_CACHE[key] = entry
-    try:
-        CACHE_FILE.write_text(json.dumps(FILE_ID_CACHE, ensure_ascii=False)[:500000], encoding="utf-8")
-    except Exception:
-        pass
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -137,6 +97,7 @@ logger = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+MAX_INLINE_QUERY_LENGTH = 256
 
 
 def derive_artist(entry: dict) -> str:
@@ -231,8 +192,8 @@ def curate_track(raw_title: str, raw_artist: str) -> tuple:
 
 
 def resolve_official(query: str) -> dict | None:
-    """Return the top TypeTube catalog hit for ``query``."""
-    results = _search_typetube_catalog(query, 1)
+    """Return the top YouTube search hit for ``query``."""
+    results = youtube.search(query, 1)
     best = results[0] if results else None
     if best:
         logger.info(
@@ -242,96 +203,25 @@ def resolve_official(query: str) -> dict | None:
     return best
 
 
-TYPE_TUBE_SEARCH_TIMEOUT = 4.0
-TYPE_TUBE_RESOLVE_TIMEOUT = 6.0
-
-
-def _search_typetube_catalog(query: str, limit: int) -> list[dict]:
-    """Fetch relevance-ranked search results from TypeTube's single-call API."""
-    from typetube import TypeTubeError, create_client
-
-    public_client = create_client(
-        endpoint=owner.TYPE_TUBE_ENDPOINT,
-        api_key="public",
-        timeout=TYPE_TUBE_SEARCH_TIMEOUT,
-    )
-    try:
-        items = public_client.search(
-            query, limit=limit, timeout=TYPE_TUBE_SEARCH_TIMEOUT
-        )
-    except TypeTubeError as error:
-        if not _is_typetube_public_limit(error):
-            raise
-        try:
-            private_key = owner.get_typetube_api_key()
-        except OSError as key_error:
-            logger.exception("Could not read the owner-managed TypeTube key.")
-            raise TypeTubeOwnerKeyUnavailable from key_error
-        if not private_key:
-            raise TypeTubeFreeQuotaExhausted from error
-        logger.info(
-            "TypeTube public search quota is exhausted; falling back to the owner key."
-        )
-        private_client = create_client(
-            endpoint=owner.TYPE_TUBE_ENDPOINT,
-            api_key=private_key,
-            timeout=TYPE_TUBE_SEARCH_TIMEOUT,
-        )
-        try:
-            items = private_client.search(
-                query, limit=limit, timeout=TYPE_TUBE_SEARCH_TIMEOUT
-            )
-        except TypeTubeError as key_error:
-            if _is_typetube_public_limit(key_error):
-                logger.error("TypeTube owner-key search failed: %s", key_error)
-                raise TypeTubeOwnerKeyUnavailable from key_error
-            raise
-
-    entries = []
-    for item in items or []:
-        video_id = str(getattr(item, "id", "") or "").strip()
-        if not video_id:
-            continue
-        title = str(getattr(item, "title", "") or "").strip() or "Unknown title"
-        artist = str(getattr(item, "uploader", "") or "").strip()
-        url = str(getattr(item, "url", "") or "").strip()
-        duration = getattr(item, "duration", None)
-        try:
-            duration = int(duration or 0)
-        except (TypeError, ValueError):
-            duration = 0
-        entries.append({
-            "id": video_id,
-            "videoId": video_id,
-            "title": title,
-            "track": title,
-            "artist": artist,
-            "artists": [artist] if artist else [],
-            "album": None,
-            "duration": duration,
-            "thumbnail": f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg",
-            "channel": artist,
-            "uploader": artist,
-            "webpage_url": url or f"https://www.youtube.com/watch?v={video_id}",
-        })
-    return entries
-
-
 SEARCH_RESULT_CACHE: dict[str, tuple[float, int, list[dict]]] = {}
 SEARCH_SELECTIONS: dict[str, dict] = {}
 SEARCH_RESULT_TTL = 300
 SEARCH_SELECTION_TTL = 600
 
 
+def _normalize_search_query(query: str) -> str:
+    return re.sub(r"\s+", " ", query.strip().casefold())
+
+
 async def resolve_candidates_async(
     query: str, application, limit: int = 6
 ) -> list[dict]:
-    """Search TypeTube's catalog (one bounded API call, relevance ordered).
+    """Search YouTube's results page with an in-memory five-minute cache.
 
     ``application`` is kept for call compatibility; results are cached in
-    memory for five minutes. No Spotify cross check or slower secondary search.
+    memory for five minutes.
     """
-    cache_key = ytmusic.normalize_query(query)
+    cache_key = _normalize_search_query(query)
     now = time.time()
     fetch = min(25, max(limit, 10))
     cached = SEARCH_RESULT_CACHE.get(cache_key)
@@ -346,16 +236,16 @@ async def resolve_candidates_async(
     search_started = time.perf_counter()
     try:
         entries = await asyncio.to_thread(
-            _search_typetube_catalog, query, fetch
+            youtube.search, query, fetch
         )
     except Exception as error:
         logger.error(
-            "TypeTube catalog search failed for %r: %s",
-            query[:100], type(error).__name__,
+            "YouTube catalog search failed for %r: %s",
+            query[:100], error,
         )
         raise
     logger.info(
-        "CATALOG_SEARCH provider=TypeTube results=%d elapsed=%.2fs",
+        "CATALOG_SEARCH provider=YouTube results=%d elapsed=%.2fs",
         len(entries), time.perf_counter() - search_started,
     )
     SEARCH_RESULT_CACHE[cache_key] = (
@@ -376,26 +266,134 @@ async def resolve_official_async(query: str, application) -> dict | None:
     return ranked[0] if ranked else None
 
 
+def _result_duration(entry: dict) -> str:
+    try:
+        seconds = int(entry.get("duration") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    if not seconds:
+        return ""
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _inline_song_article(candidate: dict) -> InlineQueryResultArticle:
+    video_id = youtube.get_video_id(str(candidate.get("id") or ""))
+    title, artist = curate_track(
+        str(candidate.get("title") or "Song"),
+        str(candidate.get("artist") or candidate.get("channel") or ""),
+    )
+    details = " · ".join(
+        part for part in (artist, _result_duration(candidate)) if part
+    )
+    thumbnail = candidate.get("thumbnail")
+    if (
+        not isinstance(thumbnail, str)
+        or not thumbnail.startswith("https://")
+        or len(thumbnail) > 2048
+    ):
+        thumbnail = None
+    host = (
+        "music.youtube.com"
+        if recognition.is_music_url(str(candidate.get("url") or ""))
+        else "www.youtube.com"
+    )
+    url = f"https://{host}/watch?v={video_id}"
+    return InlineQueryResultArticle(
+        id=video_id,
+        title=(f"{title} · {artist}" if artist else title)[:128],
+        description=details[:255] if details else None,
+        thumbnail_url=thumbnail,
+        input_message_content=InputTextMessageContent(
+            f"/play {url} --no-controls"
+        ),
+    )
+
+
+async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    inline_query = update.inline_query
+    if not inline_query:
+        return
+    query = (inline_query.query or "").strip()
+    if len(query) > MAX_INLINE_QUERY_LENGTH:
+        await inline_query.answer([], cache_time=0, is_personal=True)
+        return
+
+    try:
+        if not query:
+            candidates = []
+        elif URL_RE.match(query):
+            if not recognition.validate_media_url(query):
+                candidates = []
+            else:
+                video_id = youtube.get_video_id(query)
+                candidates = [{
+                    "id": video_id,
+                    "title": "Play YouTube song",
+                    "url": query,
+                }]
+        elif re.fullmatch(r"[A-Za-z0-9_-]{11}", query):
+            candidates = [{
+                "id": query,
+                "url": f"https://www.youtube.com/watch?v={query}",
+            }]
+        else:
+            candidates = await resolve_candidates_async(
+                query, context.application, limit=10
+            )
+
+        valid_candidates = []
+        seen_ids = set()
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            try:
+                video_id = youtube.get_video_id(str(candidate.get("id") or ""))
+            except youtube.YouTubeError:
+                continue
+            if video_id in seen_ids:
+                continue
+            seen_ids.add(video_id)
+            valid_candidates.append({
+                **candidate,
+                "id": video_id,
+                "url": (
+                    f"https://music.youtube.com/watch?v={video_id}"
+                    if recognition.is_music_url(str(candidate.get("url") or ""))
+                    else f"https://www.youtube.com/watch?v={video_id}"
+                ),
+            })
+
+        results = []
+        for candidate in valid_candidates[:10]:
+            try:
+                results.append(_inline_song_article(candidate))
+            except (TypeError, ValueError, youtube.YouTubeError) as error:
+                logger.info(
+                    "Skipping malformed inline result %s: %s",
+                    candidate.get("id"),
+                    error,
+                )
+    except (recognition.RecognitionError, youtube.YouTubeError, ValueError) as error:
+        logger.info("Inline query could not be resolved: %s", error)
+        results = []
+    except Exception:
+        logger.exception("Unexpected inline query failure for %r", query[:80])
+        results = []
+
+    await inline_query.answer(
+        results,
+        cache_time=0,
+        is_personal=True,
+    )
+
+
 def friendly_error(e: BaseException) -> str:
     msg = ANSI_RE.sub("", str(e)).strip()
     low = msg.lower()
-    if isinstance(e, (TypeTubeFreeQuotaExhausted, TypeTubeOwnerKeyUnavailable)):
-        return "Song downloads are temporarily unavailable. Please try again later."
+    if isinstance(e, youtube.YouTubeError):
+        return msg[:400]
     if isinstance(e, urllib.error.HTTPError) and e.code == 403:
         return "The audio source temporarily refused the download. Please try again."
-    if type(e).__module__.startswith("typetube") or any(
-        marker in low
-        for marker in (
-            "api key",
-            "401",
-            "unauthorized",
-            "quota",
-            "daily limit",
-            "rate limit",
-            "typetube",
-        )
-    ):
-        return "Song downloads are temporarily unavailable. Please try again later."
     if "timed out" in low or "writeTimeout" in str(type(e).__name__):
         return (
             "Upload to Telegram timed out (slow connection). "
@@ -417,7 +415,7 @@ def friendly_error(e: BaseException) -> str:
 # --- Album art: YouTube mqdefault is guaranteed JPEG 320x180 (~15KB),
 # which already satisfies Telegram's thumbnail spec (<200KB, <=320px).
 # Fetched straight into RAM; never stored.
-def fetch_cover_jpeg(video_id: str, timeout: int = 10) -> bytes | None:
+def fetch_cover_jpeg(video_id: str, timeout: int = 2) -> bytes | None:
     url = f"https://i.ytimg.com/vi/{video_id}/mqdefault.jpg"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -459,156 +457,10 @@ def embed_cover_mp3(mp3_path: Path, cover_bytes: bytes) -> bool:
         return False
 
 
-class TypeTubeFreeQuotaExhausted(RuntimeError):
-    """Raised when public TypeTube quota is spent and no owner key is available."""
-
-
-class TypeTubeOwnerKeyUnavailable(RuntimeError):
-    """Raised when the owner's private key cannot serve requests."""
-
-
-_owner_typetube_notices: set[str] = set()
-
-
-def _is_typetube_public_limit(error: BaseException) -> bool:
-    status_code = getattr(error, "status_code", None)
-    message = str(error).lower()
-    return (
-        status_code in (401, 403, 429)
-        or any(
-            marker in message
-            for marker in (
-                "quota",
-                "daily limit",
-                "rate limit",
-                "public api key",
-                "no public api key",
-            )
-        )
-    )
-
-
-def _resolve_typetube_track(target: str):
-    from typetube import TypeTubeError, create_client
-
-    public_client = create_client(
-        endpoint=owner.TYPE_TUBE_ENDPOINT,
-        api_key="public",
-        timeout=TYPE_TUBE_RESOLVE_TIMEOUT,
-    )
-    try:
-        return public_client, public_client.resolve(target)
-    except TypeTubeError as error:
-        if not _is_typetube_public_limit(error):
-            raise
-        try:
-            private_key = owner.get_typetube_api_key()
-        except OSError as key_error:
-            logger.exception("Could not read the owner-managed TypeTube key.")
-            raise TypeTubeOwnerKeyUnavailable from key_error
-        if not private_key:
-            raise TypeTubeFreeQuotaExhausted from error
-        logger.info(
-            "TypeTube public quota is exhausted; falling back to the owner key."
-        )
-        private_client = create_client(
-            endpoint=owner.TYPE_TUBE_ENDPOINT,
-            api_key=private_key,
-            timeout=TYPE_TUBE_RESOLVE_TIMEOUT,
-        )
-        try:
-            return private_client, private_client.resolve(target)
-        except TypeTubeError as key_error:
-            if _is_typetube_public_limit(key_error):
-                logger.error("TypeTube owner-key fallback failed: %s", key_error)
-                raise TypeTubeOwnerKeyUnavailable from key_error
-            raise
-
-
-async def _notify_owner_typetube_issue(bot, issue: str, detail: str) -> None:
-    owner_id = OWNER_CONSOLE.owner_id
-    notice_key = f"{datetime.now(timezone.utc).date().isoformat()}:{issue}"
-    if not owner_id or notice_key in _owner_typetube_notices:
-        return
-    try:
-        await bot.send_message(
-            chat_id=owner_id,
-            text=detail,
-        )
-    except TelegramError as error:
-        logger.warning("Could not notify owner about TypeTube quota: %s", error)
-        return
-    _owner_typetube_notices.add(notice_key)
-    if len(_owner_typetube_notices) > 64:
-        _owner_typetube_notices.clear()
-
-
-def _download_typetube_source(client, track, target: str, source_path: Path):
-    """Download a TypeTube stream, refreshing one expired/denied stream URL."""
-    for attempt in (1, 2):
-        try:
-            if hasattr(os, "pwrite"):
-                result = client.download_audio(
-                    track,
-                    output_path=str(source_path),
-                    workers=8 if attempt == 1 else 4,
-                    chunk_size=4 * 1024 * 1024,
-                )
-                return (
-                    client,
-                    track,
-                    result.bytes_written,
-                    result.average_speed_mbps,
-                )
-
-            request = urllib.request.Request(
-                track.best_audio.url,
-                headers={
-                    "User-Agent": "Mozilla/5.0",
-                    "Accept": "*/*",
-                },
-            )
-            bytes_written = 0
-            with urllib.request.urlopen(request, timeout=30) as response:
-                with source_path.open("wb") as output:
-                    while True:
-                        chunk = response.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        bytes_written += len(chunk)
-                        if MAX_FILE_MB and bytes_written > MAX_FILE_MB * 1024 * 1024:
-                            raise ValueError(
-                                f"Source audio exceeds the {MAX_FILE_MB} MB limit."
-                            )
-                        output.write(chunk)
-            return client, track, bytes_written, None
-        except Exception as error:
-            status_code = getattr(
-                error, "code", getattr(error, "status_code", None)
-            )
-            if status_code != 403 or attempt == 2:
-                raise
-            logger.warning(
-                "TypeTube stream returned HTTP 403; resolving a fresh stream URL."
-            )
-            refreshed_client, refreshed_track = _resolve_typetube_track(target)
-            if (
-                not refreshed_track.success
-                or not refreshed_track.best_audio
-                or not refreshed_track.best_audio.url
-            ):
-                raise RuntimeError(
-                    "TypeTube could not provide a fresh audio stream after HTTP 403."
-                ) from error
-            source_path.unlink(missing_ok=True)
-            client, track = refreshed_client, refreshed_track
-    raise RuntimeError("TypeTube audio download failed after refreshing the stream.")
-
-
 def download_song_to_ram(
     query: str, metadata_callback=None, picked_override: dict | None = None
 ) -> dict:
-    """Resolve/download with TypeTube, transcode to MP3, then return bytes."""
+    """Resolve/download a YouTube player stream, transcode it, and return bytes."""
     is_url = bool(URL_RE.match(query.strip()))
     if is_url:
         target = query.strip()
@@ -622,23 +474,22 @@ def download_song_to_ram(
             )
         target = f"https://www.youtube.com/watch?v={picked['id']}"
     resolve_started = time.perf_counter()
-    client, track = _resolve_typetube_track(target)
+    track = youtube.resolve(target)
     resolve_seconds = time.perf_counter() - resolve_started
     logger.info(
-        "SOURCE_RESOLVE provider=TypeTube took %.2fs latency=%.0fms id=%s",
-        resolve_seconds, track.latency_ms, track.id,
+        "SOURCE_RESOLVE provider=YouTubePlayer took %.2fs id=%s",
+        resolve_seconds, track["id"],
     )
-    if not track.success or not track.id or not track.best_audio or not track.best_audio.url:
-        raise RuntimeError("TypeTube did not return a playable audio stream.")
+    audio_format = youtube.select_audio_format(track["formats"])
 
-    duration = int(track.duration_seconds or 0)
+    duration = int(track["duration"] or 0)
     if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
         raise ValueError(
             f"Too long ({duration // 60}:{duration % 60:02d}). "
             f"Max allowed is {MAX_DURATION_SEC // 60} min."
         )
-    track_title = track.title or (picked_override or {}).get("title") or query
-    track_artist = track.author or (picked_override or {}).get("artist") or ""
+    track_title = track["title"] or (picked_override or {}).get("title") or query
+    track_artist = track["author"] or (picked_override or {}).get("artist") or ""
     display_title, display_artist = curate_track(track_title, track_artist)
     if metadata_callback:
         label = f"{display_title} · {display_artist}" if display_artist else display_title
@@ -647,29 +498,43 @@ def download_song_to_ram(
         except Exception as error:
             logger.warning("Could not report resolved track metadata: %s", error)
 
-    mime_type = (track.best_audio.mime_type or "").lower()
-    source_suffix = (
-        ".m4a" if "mp4" in mime_type or "m4a" in mime_type else
-        ".webm" if "webm" in mime_type else
-        ".ogg" if "ogg" in mime_type else
-        ".mp3" if "mpeg" in mime_type else ".audio"
-    )
+    source_suffix = youtube.format_extension(audio_format)
     with tempfile.TemporaryDirectory(prefix="songbot_") as tmpdir:
-        source_path = Path(tmpdir) / f"{track.id}{source_suffix}"
-        mp3_path = Path(tmpdir) / f"{track.id}.mp3"
+        source_path = Path(tmpdir) / f"{track['id']}{source_suffix}"
         download_started = time.perf_counter()
-        client, track, bytes_written, average_speed = _download_typetube_source(
-            client, track, target, source_path
-        )
+        try:
+            bytes_written = youtube.download_format(
+                audio_format,
+                source_path,
+                max_bytes=MAX_FILE_MB * 1024 * 1024 if MAX_FILE_MB else None,
+            )
+        except urllib.error.HTTPError as error:
+            if error.code != 403:
+                raise
+            logger.warning(
+                "YouTube stream returned HTTP 403; refreshing its direct URL once."
+            )
+            track = youtube.resolve(target)
+            audio_format = youtube.select_audio_format(track["formats"])
+            source_suffix = youtube.format_extension(audio_format)
+            source_path = Path(tmpdir) / f"{track['id']}{source_suffix}"
+            duration = int(track["duration"] or 0)
+            if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
+                raise ValueError(
+                    f"Too long ({duration // 60}:{duration % 60:02d}). "
+                    f"Max allowed is {MAX_DURATION_SEC // 60} min."
+                ) from error
+            bytes_written = youtube.download_format(
+                audio_format,
+                source_path,
+                max_bytes=MAX_FILE_MB * 1024 * 1024 if MAX_FILE_MB else None,
+            )
         download_seconds = time.perf_counter() - download_started
         if not source_path.is_file() or source_path.stat().st_size < 1024:
-            raise RuntimeError("TypeTube audio download did not produce a file.")
-        if average_speed is None:
-            average_speed = (
-                bytes_written / (1024 * 1024) / max(download_seconds, 0.01)
-            )
+            raise RuntimeError("YouTube audio download did not produce a file.")
+        average_speed = bytes_written / (1024 * 1024) / max(download_seconds, 0.01)
         logger.info(
-            "SOURCE_DOWNLOAD provider=TypeTube took %.2fs size=%.2fMB effective=%.2fMB/s",
+            "SOURCE_DOWNLOAD provider=YouTubePlayer took %.2fs size=%.2fMB effective=%.2fMB/s",
             download_seconds,
             bytes_written / (1024 * 1024),
             average_speed,
@@ -679,6 +544,7 @@ def download_song_to_ram(
             raise ValueError(
                 f"Source audio is too large ({source_mb:.1f} MB > {MAX_FILE_MB} MB)."
             )
+        mp3_path = Path(tmpdir) / f"{track['id']}.mp3"
         transcode_started = time.perf_counter()
         proc = subprocess.run(
             [
@@ -691,32 +557,38 @@ def download_song_to_ram(
         )
         if proc.returncode or not mp3_path.is_file() or mp3_path.stat().st_size < 1024:
             detail = proc.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Could not convert TypeTube audio to MP3: {detail[:200]}")
+            raise RuntimeError(
+                f"Could not convert YouTube audio to MP3: {detail[:200]}"
+            )
         logger.info(
-            "SOURCE_TRANSCODE provider=TypeTube took %.2fs",
+            "SOURCE_TRANSCODE provider=YouTubePlayer took %.2fs bitrate=%sk",
             time.perf_counter() - transcode_started,
+            MP3_QUALITY,
         )
-        size_mb = mp3_path.stat().st_size / (1024 * 1024)
+        output_path = mp3_path
+        output_suffix = ".mp3"
+        size_mb = output_path.stat().st_size / (1024 * 1024)
         if MAX_FILE_MB and size_mb > MAX_FILE_MB:
             raise ValueError(
                 f"File too large ({size_mb:.1f} MB > {MAX_FILE_MB} MB). "
                 "Try a shorter song."
             )
-        video_id = track.id
+        video_id = track["id"]
         cover_bytes = fetch_cover_jpeg(video_id)
-        if cover_bytes:
-            embed_cover_mp3(mp3_path, cover_bytes)
-        audio_bytes = mp3_path.read_bytes()
+        if cover_bytes and output_suffix == ".mp3":
+            embed_cover_mp3(output_path, cover_bytes)
+        audio_bytes = output_path.read_bytes()
 
     return {
         "audio_bytes": audio_bytes,
+        "audio_filename": f"{video_id}{output_suffix}",
         "cover_bytes": cover_bytes,
         "size_mb": size_mb,
         "title": display_title,
         "uploader": display_artist,
         "duration": duration,
         "album": None,
-        "thumbnail": track.thumbnail,
+        "thumbnail": track["thumbnail"],
         "webpage_url": target,
         "id": video_id,
     }
@@ -1093,18 +965,26 @@ async def _playlist_callback(query, context: ContextTypes.DEFAULT_TYPE) -> None:
             )
             await _safe_answer(query)
         elif parts[1] == "play" and len(parts) == 3:
-            song = OWNER_CONSOLE.get_playlist_song(user_id, int(parts[2]))
-            if not song:
+            saved_song = OWNER_CONSOLE.get_playlist_song(user_id, int(parts[2]))
+            if not saved_song or not saved_song.get("video_id"):
                 await _safe_answer(query, "Song not found in your playlists.", show_alert=True)
                 return
-            await context.bot.send_audio(
-                chat_id=query.message.chat.id,
-                audio=song["file_id"],
-                title=song["title"][:64],
-                performer=song["artist"],
-                duration=song["duration"] or None,
+            if not await _safe_answer(query):
+                return
+            delivery_update = SimpleNamespace(
+                message=query.message,
+                effective_user=query.from_user,
+                effective_chat=query.message.chat,
             )
-            await _safe_answer(query)
+            delivery_context = SimpleNamespace(
+                args=[
+                    f"https://www.youtube.com/watch?v={saved_song['video_id']}"
+                ],
+                bot=context.bot,
+                application=context.application,
+                no_controls=True,
+            )
+            await song(delivery_update, delivery_context)
         else:
             await _safe_answer(query, "Invalid playlist action.", show_alert=True)
     except (ValueError, TelegramError) as error:
@@ -1168,40 +1048,38 @@ def parse_song_args(args: list[str]) -> tuple[str, bool]:
     return " ".join(query_args).strip(), inline_selection
 
 
-def _result_duration(entry: dict) -> str:
-    seconds = int(entry.get("duration") or 0)
-    if not seconds:
-        return ""
-    return f"{seconds // 60}:{seconds % 60:02d}"
+def _resolve_inline_audio(entry: dict) -> InlineQueryResultAudio:
+    video_id = str(entry["id"])
+    track = youtube.resolve(video_id)
+    audio = youtube.select_inline_audio_format(track["formats"])
+    title, artist = curate_track(
+        str(track.get("title") or entry.get("title") or "Unknown"),
+        str(track.get("author") or entry.get("channel") or ""),
+    )
+    duration = int(track.get("duration") or entry.get("duration") or 0)
+    return InlineQueryResultAudio(
+        id=video_id,
+        audio_url=audio["url"],
+        title=title[:64],
+        performer=artist[:64] if artist else None,
+        audio_duration=duration or None,
+        thumb_url=track.get("thumbnail") or entry.get("thumbnail"),
+    )
 
 
 async def _inline_link_answer(inline_query, url: str) -> None:
-    """Offer a pasted link as one inline result that downloads audio directly."""
+    """Offer a pasted YouTube link as a playable inline audio result."""
     if not recognition.validate_media_url(url):
         await inline_query.answer([], cache_time=15, is_personal=True)
         return
-    if recognition.is_music_url(url):
-        title, description = (
-            "Play this song",
-            "Send it to the chat to download straight away",
-        )
-        content = f"/play {url} --no-controls"
-    else:
-        title, description = (
-            "Download audio",
-            "Send it to the chat to fetch straight away",
-        )
-        content = f"/play {url} --no-controls"
+    video_id = youtube.get_video_id(url)
+    result = await asyncio.to_thread(
+        _resolve_inline_audio,
+        {"id": video_id},
+    )
     await inline_query.answer(
-        [
-            InlineQueryResultArticle(
-                id="link-preview",
-                title=title,
-                description=description,
-                input_message_content=InputTextMessageContent(content),
-            )
-        ],
-        cache_time=15,
+        [result],
+        cache_time=0,
         is_personal=True,
     )
 
@@ -1229,34 +1107,29 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     try:
         candidates = await resolve_candidates_async(
-            query, context.application, limit=10
+            query, context.application, limit=5
+        )
+        candidates = [entry for entry in candidates if entry.get("id")][:5]
+        resolved = await asyncio.gather(
+            *(
+                asyncio.to_thread(_resolve_inline_audio, entry)
+                for entry in candidates
+            ),
+            return_exceptions=True,
         )
         results = []
-        for entry in candidates:
-            video_id = entry.get("id")
-            if not video_id:
-                continue
-            title, artist = curate_track(
-                derive_title(entry), derive_artist(entry)
-            )
-            label = f"{title} · {artist}" if artist else title
-            detail = " · ".join(
-                part for part in (artist, _result_duration(entry)) if part
-            )
-            results.append(
-                InlineQueryResultArticle(
-                    id=str(video_id),
-                    title=label[:128],
-                    description=detail[:255] if detail else None,
-                    thumbnail_url=entry.get("thumbnail"),
-                    input_message_content=InputTextMessageContent(
-                        f"/play https://music.youtube.com/watch?v={video_id} --no-controls"
-                    ),
+        for entry, result in zip(candidates, resolved):
+            if isinstance(result, Exception):
+                logger.warning(
+                    "Could not resolve inline audio for %s: %s",
+                    entry.get("id"),
+                    result,
                 )
-            )
+                continue
+            results.append(result)
         await inline_query.answer(
-            results[:10],
-            cache_time=15,
+            results,
+            cache_time=0,
             is_personal=True,
         )
     except Exception:
@@ -1856,7 +1729,6 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     no_controls = bool(getattr(context, "no_controls", False))
     uid = update.effective_user.id if update.effective_user else None
     default_fx = get_default_effect(uid)
-    ckey = query if default_fx == "off" else f"{query}::{default_fx}"
     recognition_candidate = getattr(context, "recognition_candidate", None)
     recognized_song = getattr(context, "recognized_song", None)
 
@@ -1916,54 +1788,6 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             SEARCH_SELECTIONS.pop(selection_token, None)
             raise
         return
-
-    # FAST PATH: repeat song -> resend by Telegram file_id, no
-    # download/transcode/upload. This is the only path that hits 300-500ms.
-    cache_key = ckey
-    if recognition_candidate:
-        candidate_id = recognition_candidate.get("id")
-        if candidate_id:
-            cache_key = (
-                candidate_id
-                if default_fx == "off"
-                else f"{candidate_id}::{default_fx}"
-            )
-    hit = cache_lookup(cache_key)
-    if hit and hit.get("file_id"):
-        try:
-            # No caption: clean player card with curated title/artist only.
-            sent = await update.message.reply_audio(
-                audio=hit["file_id"],
-                title=_no_dashes(hit.get("title") or query)[:64],
-                performer=_no_dashes(hit.get("uploader")) if hit.get("uploader") else None,
-                duration=hit.get("duration") or None,
-            )
-            chat_id = update.effective_chat.id
-            try:
-                await context.bot.edit_message_reply_markup(
-                    chat_id,
-                    sent.message_id,
-                    reply_markup=song_menu(
-                        chat_id, sent.message_id, no_controls
-                    ),
-                )
-            except TelegramError as error:
-                logger.warning("Could not attach song controls: %s", error)
-            remember_session(chat_id, sent.message_id, {
-                "query": query, "video_id": hit.get("video_id"),
-                "title": hit.get("title"), "uploader": hit.get("uploader"),
-                "base_title": hit.get("base_title") or hit.get("title"),
-                "applied_effect": hit.get("applied_effect", default_fx),
-                "duration": hit.get("duration"), "album": hit.get("album"),
-                "file_id": hit.get("file_id"),
-                "cover_bytes": None,
-                "playlist_only": no_controls,
-            })
-            logger.info("CACHE HIT '%s' in %.0fms", query, (time.perf_counter() - t0) * 1000)
-            return
-        except Exception:
-            logger.warning("Stale file_id for '%s'; falling back to fresh fetch.", query)
-            FILE_ID_CACHE.pop(cache_key, None)
 
     status = await update.message.reply_text(
         searching_status_html(query),
@@ -2039,12 +1863,16 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 metadata_task.cancel()
             await asyncio.gather(metadata_task, return_exceptions=True)
         logger.info(
-            "FETCH_PIPELINE '%s' took %.2fs; output=%.2fMiB bitrate=%sk",
-            query, time.perf_counter() - t_dl, meta["size_mb"], MP3_QUALITY,
+            "FETCH_PIPELINE '%s' took %.2fs; output=%.2fMiB format=%s",
+            query, time.perf_counter() - t_dl, meta["size_mb"],
+            Path(meta.get("audio_filename", "audio.mp3")).suffix,
         )
         duration = int(meta.get("duration") or 0)
         album = meta.get("album")
         original_audio_data = meta["audio_bytes"]
+        original_audio_filename = meta.get(
+            "audio_filename", f"{meta['id']}.mp3"
+        )
         base_title = meta["title"]
         applied_effect = "off"
 
@@ -2064,6 +1892,7 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     query, default_fx, time.perf_counter() - effect_started,
                 )
                 meta["audio_bytes"] = out_bytes
+                meta["audio_filename"] = f"{meta['id']}.mp3"
                 meta["size_mb"] = len(out_bytes) / (1024 * 1024)
                 meta["title"] = f"{meta['title']} {EFFECTS[default_fx]['suffix']}"[:64]
                 applied_effect = default_fx
@@ -2077,9 +1906,12 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.chat.send_action(ChatAction.UPLOAD_VOICE)
 
         audio_data = meta["audio_bytes"]
-        audio_file = InputFile(audio_data, filename=f"{meta['id']}.mp3")
+        audio_file = InputFile(
+            audio_data,
+            filename=meta.get("audio_filename", f"{meta['id']}.mp3"),
+        )
 
-        # 320k files are ~2.4MB/min (~12 MB for 5 min) — need long timeouts.
+        # Upload duration depends on file size, connection speed, and Telegram processing.
         # No caption: curated title/performer + album-art thumbnail card.
         performer = _no_dashes(meta.get("uploader") or "")[:64] or None
         thumb_data = meta.get("cover_bytes")
@@ -2122,31 +1954,6 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             meta["size_mb"], upload_mbps, time.perf_counter() - t0,
         )
 
-        # Store file_id for instant (~300-500ms) repeat sends.
-        # Keys carry the effect so plain/effected variants never collide.
-        vkey = (
-            meta["id"] if applied_effect == "off"
-            else f"{meta['id']}::{applied_effect}"
-        )
-        try:
-            if sent and sent.audio:
-                cache_entry = {
-                    "file_id": sent.audio.file_id,
-                    "video_id": meta["id"],
-                    "title": meta["title"],
-                    "base_title": base_title,
-                    "applied_effect": applied_effect,
-                    "uploader": meta["uploader"],
-                    "album": album,
-                    "duration": duration,
-                    "query": ckey,
-                }
-                cache_store(vkey, cache_entry)
-                if applied_effect != "off":
-                    cache_store(f"{meta['id']}:{applied_effect}", cache_entry)
-                cache_store(ckey, FILE_ID_CACHE[vkey])
-        except Exception:
-            pass
         chat_id = update.effective_chat.id
         try:
             await context.bot.edit_message_reply_markup(
@@ -2164,47 +1971,11 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "file_id": sent.audio.file_id if sent and sent.audio else None,
             "cover_bytes": thumb_data,
             "original_audio_bytes": original_audio_data,
+            "original_audio_filename": original_audio_filename,
             "playlist_only": no_controls,
         })
         await status.delete()
 
-    except TypeTubeFreeQuotaExhausted:
-        await _notify_owner_typetube_issue(
-            context.bot,
-            "free-quota",
-            "TypeTube's anonymous daily resolve quota has been exhausted. "
-            "Users are seeing a generic temporary-unavailable message. Add a "
-            "private fallback key with /apikey; it will be used after the free "
-            "quota is spent.",
-        )
-        logger.warning(
-            "TypeTube public daily quota is exhausted and no owner fallback key is available."
-        )
-        err_msg = error_html(
-            "Temporarily unavailable",
-            "Song downloads are temporarily unavailable. Please try again later.",
-        )
-        try:
-            await status.edit_text(err_msg, parse_mode="HTML")
-        except TelegramError as error:
-            logger.warning("Could not update TypeTube quota status: %s", error)
-    except TypeTubeOwnerKeyUnavailable:
-        await _notify_owner_typetube_issue(
-            context.bot,
-            "owner-key",
-            "TypeTube could not serve a request with the saved private key. "
-            "Check its validity/quota and update it with /apikey if needed. "
-            "Users are only seeing a generic unavailable message.",
-        )
-        logger.warning("TypeTube owner-key fallback did not resolve the request.")
-        err_msg = error_html(
-            "Temporarily unavailable",
-            "Song downloads are temporarily unavailable. Please try again later.",
-        )
-        try:
-            await status.edit_text(err_msg, parse_mode="HTML")
-        except TelegramError as error:
-            logger.warning("Could not update TypeTube fallback status: %s", error)
     except Exception as e:
         logger.exception("Failed to process /song %s", query)
         err_msg = error_html("Download failed", friendly_error(e))
@@ -2354,7 +2125,7 @@ async def receive_recognition_input(
         await message.reply_text(
             warn_html(
                 "Unsupported link",
-                "Send a public video link from a supported platform.",
+                "Send a public YouTube video link.",
             ),
             parse_mode="HTML",
         )
@@ -2960,8 +2731,6 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def run_effect(update: Update, context: ContextTypes.DEFAULT_TYPE,
                      chat_id: int, msg_id: int, sess: dict, effect: str, spec: dict) -> None:
-    cache_key = f"{sess.get('video_id') or sess.get('query')}:{effect}"
-    cached = FILE_ID_CACHE.get(cache_key)
     status = await context.bot.send_message(
         chat_id,
         rendering_status_html(spec["label"])
@@ -2980,98 +2749,46 @@ async def run_effect(update: Update, context: ContextTypes.DEFAULT_TYPE,
         card_title = _no_dashes(new_title)
         card_performer = _no_dashes(sess.get("uploader") or "") or None
         cover_bytes = sess.get("cover_bytes")
-        cached_file_id = (
-            cached.get("file_id")
-            if cached
-            and cached.get("title") == new_title
-            and cached.get("uploader") == (sess.get("uploader") or None)
-            else None
-        )
-        if cached_file_id:
-            media = InputMediaAudio(
-                media=cached_file_id,
-                title=card_title,
-                performer=card_performer,
-                duration=sess.get("duration") or None,
-            )
+        original_audio = await _original_audio_bytes(sess)
+        if effect == "off":
+            out_bytes = original_audio
         else:
-            original_audio = await _original_audio_bytes(sess)
-            if effect == "off":
-                out_bytes = original_audio
-            else:
-                effect_started = time.perf_counter()
-                out_bytes = await apply_effect(
-                    original_audio, effect, cover_bytes
-                )
-                logger.info(
-                    "RENDER video_id=%s effect=%s took %.2fs",
-                    sess.get("video_id"), effect,
-                    time.perf_counter() - effect_started,
-                )
-            media = InputMediaAudio(
-                media=InputFile(
-                    out_bytes,
-                    filename=f"{sess.get('video_id', 'song')}_{effect}.mp3",
-                    attach=True,
-                ),
-                title=card_title,
-                performer=card_performer,
-                duration=sess.get("duration") or None,
-                thumbnail=(
-                    InputFile(cover_bytes, filename="cover.jpg", attach=True)
-                    if cover_bytes else None
-                ),
+            effect_started = time.perf_counter()
+            out_bytes = await apply_effect(original_audio, effect, cover_bytes)
+            logger.info(
+                "RENDER video_id=%s effect=%s took %.2fs",
+                sess.get("video_id"), effect,
+                time.perf_counter() - effect_started,
             )
+        media = InputMediaAudio(
+            media=InputFile(
+                out_bytes,
+                filename=(
+                    sess.get("original_audio_filename", "song.mp3")
+                    if effect == "off"
+                    else f"{sess.get('video_id', 'song')}_{effect}.mp3"
+                ),
+                attach=True,
+            ),
+            title=card_title,
+            performer=card_performer,
+            duration=sess.get("duration") or None,
+            thumbnail=(
+                InputFile(cover_bytes, filename="cover.jpg", attach=True)
+                if cover_bytes else None
+            ),
+        )
 
-        try:
-            sent = await context.bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=msg_id,
-                media=media,
-                reply_markup=fx_menu(chat_id, msg_id, effect),
-                read_timeout=180,
-                write_timeout=180,
-                connect_timeout=60,
-                pool_timeout=60,
-            )
-        except TelegramError:
-            if not cached_file_id:
-                raise
-            logger.warning(
-                "Cached effect media could not be reused; rendering %s again.",
-                effect,
-            )
-            original_audio = await _original_audio_bytes(sess)
-            if effect == "off":
-                out_bytes = original_audio
-            else:
-                out_bytes = await apply_effect(
-                    original_audio, effect, cover_bytes
-                )
-            media = InputMediaAudio(
-                media=InputFile(
-                    out_bytes,
-                    filename=f"{sess.get('video_id', 'song')}_{effect}.mp3",
-                    attach=True,
-                ),
-                title=card_title,
-                performer=card_performer,
-                duration=sess.get("duration") or None,
-                thumbnail=(
-                    InputFile(cover_bytes, filename="cover.jpg", attach=True)
-                    if cover_bytes else None
-                ),
-            )
-            sent = await context.bot.edit_message_media(
-                chat_id=chat_id,
-                message_id=msg_id,
-                media=media,
-                reply_markup=fx_menu(chat_id, msg_id, effect),
-                read_timeout=180,
-                write_timeout=180,
-                connect_timeout=60,
-                pool_timeout=60,
-            )
+        sent = await context.bot.edit_message_media(
+            chat_id=chat_id,
+            message_id=msg_id,
+            media=media,
+            reply_markup=fx_menu(chat_id, msg_id, effect),
+            read_timeout=180,
+            write_timeout=180,
+            connect_timeout=60,
+            pool_timeout=60,
+        )
         new_file_id = sent.audio.file_id if sent and sent.audio else None
         if not new_file_id:
             raise RuntimeError("Telegram did not return the updated audio file.")
@@ -3083,15 +2800,6 @@ async def run_effect(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "file_id": new_file_id,
         }
         remember_session(chat_id, msg_id, updated)
-        cache_store(cache_key, {
-            "file_id": new_file_id,
-            "video_id": sess.get("video_id"),
-            "title": new_title,
-            "base_title": base_title,
-            "uploader": sess.get("uploader"),
-            "duration": sess.get("duration"),
-            "query": sess.get("query"),
-        })
         try:
             await status.delete()
         except Exception:
@@ -3143,6 +2851,9 @@ async def _original_audio_bytes(sess: dict) -> bytes:
     meta = await asyncio.to_thread(download_song_to_ram, source_url)
     audio_bytes = meta["audio_bytes"]
     sess["original_audio_bytes"] = audio_bytes
+    sess["original_audio_filename"] = meta.get(
+        "audio_filename", f"{video_id}.mp3"
+    )
     sess.setdefault("base_title", meta.get("title") or _base_song_title(sess))
     if meta.get("cover_bytes") and not sess.get("cover_bytes"):
         sess["cover_bytes"] = meta["cover_bytes"]
@@ -3211,7 +2922,12 @@ async def _send_edited_song(
         cover_bytes,
     )
     media_source = InputFile(
-        audio_bytes, filename=f"{sess.get('video_id') or 'song'}_edited.mp3",
+        audio_bytes,
+        filename=(
+            sess.get("original_audio_filename", "song.mp3")
+            if effect == "off"
+            else f"{sess.get('video_id') or 'song'}_edited.mp3"
+        ),
         attach=True,
     )
     thumbnail = (
@@ -3797,10 +3513,10 @@ def main() -> None:
     app.add_handler(CommandHandler("settings", settings_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
     app.add_handler(CommandHandler("play", play_cmd))
+    app.add_handler(InlineQueryHandler(inline_search))
     app.add_handler(CommandHandler("playlist", playlist_command))
     app.add_handler(CommandHandler("owner", OWNER_CONSOLE.owner_command))
     app.add_handler(CommandHandler("stats", OWNER_CONSOLE.stats_command))
-    app.add_handler(CommandHandler("apikey", OWNER_CONSOLE.apikey_command))
     app.add_handler(CommandHandler("broadcast", OWNER_CONSOLE.begin_broadcast))
     app.add_handler(
         CommandHandler("broadcast_button", OWNER_CONSOLE.broadcast_button_command)
@@ -3842,10 +3558,7 @@ def main() -> None:
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_direct_private_text))
     app.add_handler(MessageHandler(filters.PHOTO, on_pending_photo))
-    logger.info(
-        "Song audio provider: TypeTube (%s); yt-dlp retained for cross-platform previews",
-        owner.TYPE_TUBE_ENDPOINT,
-    )
+    logger.info("Song search and media provider: native YouTube integration")
     logger.info("Bot starting...")
     app.run_polling()
 

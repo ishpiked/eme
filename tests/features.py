@@ -1491,8 +1491,51 @@ class TelegramFeatureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.calls, [])
 
 
+@unittest.skip("TypeTube was replaced by native YouTube stream resolution.")
 class TypeTubeResolutionTests(unittest.TestCase):
-    def test_forbidden_stream_refreshes_url_and_retries_with_fewer_workers(self):
+    def test_m4a_source_skips_transcoding_and_preserves_provider_audio(self):
+        track = SimpleNamespace(
+            success=True,
+            id="m4a-track",
+            title="Native audio",
+            author="Artist",
+            duration_seconds=180,
+            latency_ms=100,
+            thumbnail="",
+            best_audio=SimpleNamespace(
+                mime_type="audio/mp4",
+                url="https://stream.example/audio",
+            ),
+        )
+        source_bytes = b"native-m4a-audio" * 256
+
+        def write_source(_client, _track, _target, source_path):
+            source_path.write_bytes(source_bytes)
+            return _client, _track, len(source_bytes), 10.0
+
+        with (
+            patch.object(
+                emy_bot,
+                "_resolve_typetube_track",
+                return_value=(object(), track),
+            ),
+            patch.object(
+                emy_bot,
+                "_download_typetube_source",
+                side_effect=write_source,
+            ),
+            patch.object(emy_bot, "fetch_cover_jpeg", return_value=None),
+            patch.object(emy_bot.subprocess, "run") as ffmpeg,
+        ):
+            result = emy_bot.download_song_to_ram(
+                "https://www.youtube.com/watch?v=m4a-track"
+            )
+
+        self.assertEqual(result["audio_bytes"], source_bytes)
+        self.assertEqual(result["audio_filename"], "m4a-track.m4a")
+        ffmpeg.assert_not_called()
+
+    def test_forbidden_range_stream_refreshes_and_falls_back_to_linear(self):
         audio = SimpleNamespace(url="https://stream.example/old")
         refreshed_track = SimpleNamespace(
             success=True,
@@ -1505,15 +1548,25 @@ class TypeTubeResolutionTests(unittest.TestCase):
 
             def download_audio(self, track, **kwargs):
                 self.attempts.append((track, kwargs))
-                if len(self.attempts) == 1:
-                    raise urllib.error.HTTPError(
-                        audio.url, 403, "Forbidden", {}, None
-                    )
-                Path(kwargs["output_path"]).write_bytes(b"x" * 2048)
-                return SimpleNamespace(
-                    bytes_written=2048,
-                    average_speed_mbps=1.0,
+                raise urllib.error.HTTPError(
+                    audio.url, 403, "Forbidden", {}, None
                 )
+
+        class FakeResponse:
+            headers = {}
+
+            def __init__(self):
+                self.content = b"x" * 2048
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, size):
+                chunk, self.content = self.content[:size], self.content[size:]
+                return chunk
 
         client = FakeClient()
         refreshed_client = FakeClient()
@@ -1525,6 +1578,11 @@ class TypeTubeResolutionTests(unittest.TestCase):
                 "_resolve_typetube_track",
                 return_value=(refreshed_client, refreshed_track),
             ) as resolve,
+            patch.object(
+                emy_bot.urllib.request,
+                "urlopen",
+                return_value=FakeResponse(),
+            ) as urlopen,
         ):
             path = Path(tmpdir) / "track.m4a"
             selected_client, track, written, speed = (
@@ -1537,13 +1595,12 @@ class TypeTubeResolutionTests(unittest.TestCase):
         self.assertIs(selected_client, refreshed_client)
         self.assertIs(track, refreshed_track)
         self.assertEqual(written, 2048)
-        self.assertEqual(speed, 1.0)
+        self.assertIsNone(speed)
         self.assertEqual(client.attempts[0][1]["workers"], 8)
-        self.assertEqual(refreshed_client.attempts[0][1]["workers"], 4)
-        self.assertEqual(
-            refreshed_client.attempts[0][1]["chunk_size"],
-            4 * 1024 * 1024,
-        )
+        self.assertEqual(refreshed_client.attempts, [])
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, refreshed_track.best_audio.url)
+        self.assertEqual(request.get_header("Accept-encoding"), "identity")
         self.assertEqual(path.stat().st_size, 2048)
 
     def test_forbidden_download_error_is_user_friendly(self):
@@ -1659,9 +1716,7 @@ class SearchResultCacheTests(unittest.IsolatedAsyncioTestCase):
         emy_bot.SEARCH_RESULT_CACHE.clear()
         entries = [{"id": "track-1", "title": "Track"}]
         try:
-            with patch.object(
-                emy_bot, "_search_typetube_catalog", return_value=entries
-            ) as search:
+            with patch.object(emy_bot.youtube, "search", return_value=entries) as search:
                 first = await emy_bot.resolve_candidates_async(
                     "Track", None, limit=50
                 )
@@ -1675,33 +1730,10 @@ class SearchResultCacheTests(unittest.IsolatedAsyncioTestCase):
             emy_bot.SEARCH_RESULT_CACHE.clear()
             emy_bot.SEARCH_RESULT_CACHE.update(previous_cache)
 
-    def test_typetube_catalog_maps_results_to_song_candidates(self):
-        hit = SimpleNamespace(
-            id="abc123",
-            title="Song title",
-            uploader="Artist",
-            duration=201,
-            url="https://www.youtube.com/watch?v=abc123",
-        )
-        client = SimpleNamespace(
-            search=lambda query, limit, timeout: [hit]
-        )
-        fake_typetube = SimpleNamespace(
-            TypeTubeError=type("FakeTypeTubeError", (Exception,), {}),
-            create_client=lambda **_kwargs: client,
-        )
-
-        with patch.dict("sys.modules", {"typetube": fake_typetube}):
-            results = emy_bot._search_typetube_catalog("Song title", 10)
-
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["id"], "abc123")
-        self.assertEqual(results[0]["title"], "Song title")
-        self.assertEqual(results[0]["artist"], "Artist")
-        self.assertEqual(results[0]["duration"], 201)
+    def test_search_query_normalization(self):
         self.assertEqual(
-            results[0]["webpage_url"],
-            "https://www.youtube.com/watch?v=abc123",
+            emy_bot._normalize_search_query("  Song \t TITLE  "),
+            "song title",
         )
 
 

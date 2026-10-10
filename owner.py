@@ -7,7 +7,6 @@ import logging
 import os
 import re
 import sqlite3
-import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,9 +21,6 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 logger = logging.getLogger(__name__)
 
 OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)
-TYPE_TUBE_ENDPOINT = os.getenv(
-    "TYPETUBE_ENDPOINT", "https://typetube.xysushi.in"
-).strip().rstrip("/")
 BROADCAST_MAX_BUTTONS = 10
 BROADCAST_MAX_BUTTONS_PER_ROW = 2
 BROADCAST_MAX_ROWS = 5
@@ -47,41 +43,6 @@ DATA_DIR = _data_dir()
 DATABASE_FILE = Path(
     os.getenv("BOT_DATABASE_FILE", str(DATA_DIR / "bot-state.sqlite3"))
 ).expanduser()
-TYPE_TUBE_KEY_FILE = Path(
-    os.getenv("TYPETUBE_KEY_FILE", str(DATA_DIR / "typetube-api-key"))
-).expanduser()
-
-
-def get_typetube_api_key() -> str | None:
-    try:
-        value = TYPE_TUBE_KEY_FILE.read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    except OSError:
-        logger.exception("Could not read the TypeTube credential file.")
-        raise
-    return value or None
-
-
-def _save_api_key(value: str) -> None:
-    TYPE_TUBE_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        prefix="typetube-key-", dir=TYPE_TUBE_KEY_FILE.parent
-    )
-    temporary = Path(temporary_name)
-    try:
-        if os.name != "nt":
-            os.chmod(temporary, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as key_file:
-            key_file.write(value)
-            key_file.flush()
-            os.fsync(key_file.fileno())
-        temporary.replace(TYPE_TUBE_KEY_FILE)
-        if os.name != "nt":
-            os.chmod(TYPE_TUBE_KEY_FILE, 0o600)
-    finally:
-        if temporary.exists():
-            temporary.unlink()
 
 
 def _keyboard(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
@@ -235,10 +196,9 @@ class OwnerConsole:
         self, user_id: int, playlist_id: int, song: dict
     ) -> bool:
         video_id = song.get("video_id")
-        file_id = song.get("file_id")
-        if not file_id:
-            raise ValueError("This song is no longer available to save.")
-        song_key = f"{video_id}:{song.get('applied_effect', 'off')}" if video_id else file_id
+        if not video_id:
+            raise ValueError("This song has no YouTube video ID to save.")
+        song_key = f"{video_id}:{song.get('applied_effect', 'off')}"
         with self._connect() as db:
             if not db.execute(
                 "SELECT 1 FROM playlists WHERE id=? AND user_id=?",
@@ -253,7 +213,7 @@ class OwnerConsole:
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    playlist_id, song_key, file_id, video_id,
+                    playlist_id, song_key, "", video_id,
                     song.get("title") or "Song", song.get("artist"),
                     song.get("duration"),
                     datetime.now(timezone.utc).isoformat(),
@@ -267,7 +227,7 @@ class OwnerConsole:
         with self._connect() as db:
             rows = db.execute(
                 """
-                SELECT s.id, s.file_id, s.title, s.artist, s.duration
+                SELECT s.id, s.video_id, s.title, s.artist, s.duration
                 FROM playlist_songs s
                 JOIN playlists p ON p.id=s.playlist_id
                 WHERE p.id=? AND p.user_id=?
@@ -295,7 +255,7 @@ class OwnerConsole:
         with self._connect() as db:
             row = db.execute(
                 """
-                SELECT s.file_id, s.title, s.artist, s.duration
+                SELECT s.video_id, s.title, s.artist, s.duration
                 FROM playlist_songs s
                 JOIN playlists p ON p.id=s.playlist_id
                 WHERE s.id=? AND p.user_id=?
@@ -380,8 +340,6 @@ class OwnerConsole:
             "<b>Owner Console</b>\n\n"
             "<b>Available commands</b>\n"
             "• <code>/stats</code> — view bot statistics and broadcast results\n"
-            "• <code>/apikey</code> — set or replace the TypeTube API key\n"
-            "• <code>/apikey remove</code> — remove the saved API key\n"
             "• <code>/broadcast</code> — open the button-based composer\n"
             "• <code>/broadcast_status</code> — review recent delivery progress\n"
             "• <code>/broadcast_resume &lt;id&gt;</code> — resume an interrupted broadcast\n\n"
@@ -391,10 +349,6 @@ class OwnerConsole:
             reply_markup=_keyboard([
                 InlineKeyboardButton(
                     "Stats", callback_data="owner:stats",
-                    style=KeyboardButtonStyle.PRIMARY,
-                ),
-                InlineKeyboardButton(
-                    "Set API key", callback_data="owner:apikey",
                     style=KeyboardButtonStyle.PRIMARY,
                 ),
                 InlineKeyboardButton(
@@ -497,39 +451,6 @@ class OwnerConsole:
             f"<b>Recent broadcasts</b>\n{recent_text}"
         )
 
-    async def apikey_command(
-        self, update: Update, context: ContextTypes.DEFAULT_TYPE
-    ) -> None:
-        user, message, chat = (
-            update.effective_user, update.effective_message, update.effective_chat
-        )
-        if not message or not await self._require_owner_private(update):
-            return
-        if context.args and context.args[0].lower() in ("remove", "delete"):
-            try:
-                TYPE_TUBE_KEY_FILE.unlink(missing_ok=True)
-            except OSError as error:
-                logger.exception("Could not remove the TypeTube API key.")
-                await message.reply_text(f"Could not remove the API key: {error}")
-            else:
-                await message.reply_text("TypeTube API key removed.")
-            return
-        await self._prompt_for_api_key(message)
-
-    async def _prompt_for_api_key(self, message) -> None:
-        prompt = await message.reply_text(
-            "<b>TypeTube API key</b>\n\n"
-            "Please send your private API key to configure the bot. "
-            "It will be verified before it is saved.\n\n"
-            "Use <code>/cancel</code> to abort.",
-            parse_mode="HTML",
-        )
-        self.awaiting[self.owner_id] = {
-            "kind": "api_key",
-            "prompt_chat_id": prompt.chat_id,
-            "prompt_message_id": prompt.message_id,
-        }
-
     async def begin_broadcast(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
     ) -> None:
@@ -570,45 +491,6 @@ class OwnerConsole:
         if not pending or not message:
             return
         kind = pending.get("kind")
-        if kind == "api_key":
-            key = (message.text or "").strip()
-            try:
-                if not key or len(key) > 4096 or any(char.isspace() for char in key):
-                    raise ValueError("The API key must be a non-empty single-line value.")
-                from typetube import create_client
-
-                usage = await asyncio.to_thread(
-                    create_client(
-                        endpoint=TYPE_TUBE_ENDPOINT, api_key=key, timeout=10
-                    ).usage
-                )
-                if not usage.success:
-                    raise ValueError("TypeTube did not validate this API key.")
-                _save_api_key(key)
-            except Exception as error:
-                await message.reply_text(f"Could not save the API key: {error}")
-            else:
-                await message.reply_text("TypeTube API key saved.")
-            finally:
-                prompt_chat_id = pending.get("prompt_chat_id")
-                prompt_message_id = pending.get("prompt_message_id")
-                self.awaiting.pop(user.id, None)
-                if prompt_chat_id and prompt_message_id:
-                    try:
-                        await context.bot.delete_message(
-                            chat_id=prompt_chat_id,
-                            message_id=prompt_message_id,
-                        )
-                    except TelegramError as error:
-                        logger.warning(
-                            "Could not delete the TypeTube API-key prompt: %s",
-                            error,
-                        )
-                try:
-                    await message.delete()
-                except TelegramError as error:
-                    logger.warning("Could not delete the owner's API-key message: %s", error)
-            raise ApplicationHandlerStop
         if kind == "broadcast_content":
             content_type = "text" if message.text is not None else "media"
             rich_text = (

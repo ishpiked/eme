@@ -17,7 +17,7 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(recognition.validate_media_url(
             "https://www.youtube.com/watch?v=abc"
         ))
-        self.assertTrue(recognition.validate_media_url(
+        self.assertFalse(recognition.validate_media_url(
             "https://www.tiktok.com/@user/video/123"
         ))
         self.assertFalse(recognition.validate_media_url(
@@ -43,6 +43,60 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(recognition.is_music_url(
             "https://example.com/video"
         ))
+
+    def test_song_audio_is_transcoded_to_configured_mp3_bitrate(self):
+        track = {
+            "id": "abcdefghijk",
+            "title": "Song",
+            "author": "Artist",
+            "duration": 180,
+            "thumbnail": None,
+            "formats": [],
+        }
+        source_format = {
+            "mimeType": "audio/mp4",
+            "url": "https://stream.example/audio",
+        }
+
+        def download(_stream, destination, max_bytes):
+            destination.write_bytes(b"source audio" * 200)
+            return destination.stat().st_size
+
+        def transcode(command, **_kwargs):
+            Path(command[-1]).write_bytes(b"mp3 output" * 200)
+            return SimpleNamespace(returncode=0, stderr=b"")
+
+        with (
+            patch.object(emy_bot.youtube, "resolve", return_value=track),
+            patch.object(
+                emy_bot.youtube,
+                "select_audio_format",
+                return_value=source_format,
+            ),
+            patch.object(
+                emy_bot.youtube, "format_extension", return_value=".m4a"
+            ),
+            patch.object(
+                emy_bot.youtube,
+                "download_format",
+                side_effect=download,
+            ),
+            patch.object(
+                emy_bot.subprocess, "run", side_effect=transcode
+            ) as ffmpeg,
+            patch.object(emy_bot, "fetch_cover_jpeg", return_value=None),
+        ):
+            result = emy_bot.download_song_to_ram(
+                "https://www.youtube.com/watch?v=abcdefghijk"
+            )
+
+        self.assertEqual(result["audio_filename"], "abcdefghijk.mp3")
+        self.assertEqual(
+            ffmpeg.call_args.args[0][
+                ffmpeg.call_args.args[0].index("-b:a") + 1
+            ],
+            f"{emy_bot.MP3_QUALITY}k",
+        )
 
     def test_recognizes_only_audio_and_video_upload_types(self):
         self.assertTrue(recognition.is_audio_or_video("audio/mpeg", "track"))
@@ -102,40 +156,44 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             work_dir = Path(temp_dir)
             preview = work_dir / "preview.mp4"
-            captured_options = {}
+            selected_format = {
+                "url": "https://stream.example/video",
+                "mimeType": 'video/mp4; codecs="avc1,mp4a"',
+                "width": 1280,
+                "height": 720,
+                "hasAudio": True,
+                "hasVideo": True,
+                "contentLength": 1024,
+            }
 
-            class FakeDownloader:
-                def __init__(self, options):
-                    captured_options.update(options)
-
-                def __enter__(self):
-                    return self
-
-                def __exit__(self, *_args):
-                    return False
-
-                def extract_info(self, _url, download):
-                    self.assert_download = download
-                    preview.write_bytes(b"video-preview")
-                    return {"id": "abc", "width": 1280, "height": 720}
-
-                def prepare_filename(self, _info):
-                    return str(work_dir / "preview.webm")
+            def download(_format, destination, max_bytes):
+                self.assertEqual(max_bytes, recognition.MAX_RECOGNITION_FILE_BYTES)
+                destination.write_bytes(b"video-preview")
+                return destination.stat().st_size
 
             with patch.object(
-                recognition.yt_dlp, "YoutubeDL", FakeDownloader
+                recognition.youtube,
+                "resolve",
+                return_value={
+                    "id": "abcdefghijk",
+                    "title": "Test video",
+                    "formats": [selected_format],
+                },
+            ), patch.object(
+                recognition.youtube,
+                "select_preview_format",
+                return_value=selected_format,
+            ), patch.object(
+                recognition.youtube,
+                "download_format",
+                side_effect=download,
             ):
                 result_path, info = await recognition.download_url_preview(
-                    "https://www.youtube.com/watch?v=abc", work_dir
+                    "https://www.youtube.com/watch?v=abcdefghijk", work_dir
                 )
 
         self.assertEqual(result_path, preview)
         self.assertEqual(info["height"], 720)
-        self.assertIn("[height<=720]", captured_options["format"])
-        self.assertEqual(
-            captured_options["max_filesize"],
-            recognition.MAX_RECOGNITION_FILE_BYTES,
-        )
 
     async def test_unavailable_shazam_service_returns_actionable_error(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -183,6 +241,38 @@ class SongRecognitionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(delivery_context.args, [url])
         self.assertEqual(delivery_update.effective_chat.id, 9)
         self.assertEqual(len(emy_bot.RECOGNITION_REQUESTS), 0)
+
+    async def test_inline_query_resolves_results_without_result_cache(self):
+        query = SimpleNamespace(
+            query="song name",
+            answer=AsyncMock(),
+        )
+        update = SimpleNamespace(inline_query=query)
+        candidates = [{"id": "abcdefghijk"}]
+        result = SimpleNamespace(id="abcdefghijk")
+        application = SimpleNamespace()
+
+        with (
+            patch.object(
+                emy_bot,
+                "resolve_candidates_async",
+                new=AsyncMock(return_value=candidates),
+            ) as search,
+            patch.object(
+                emy_bot,
+                "_resolve_inline_audio",
+                return_value=result,
+            ) as resolve,
+        ):
+            await emy_bot.inline_search(
+                update, SimpleNamespace(application=application)
+            )
+
+        search.assert_awaited_once_with("song name", application, limit=5)
+        resolve.assert_called_once_with(candidates[0])
+        query.answer.assert_awaited_once_with(
+            [result], cache_time=0, is_personal=True
+        )
 
     async def test_supported_url_sends_720p_preview_with_recognition_button(self):
         class FakeStatus:
