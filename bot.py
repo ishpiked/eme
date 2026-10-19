@@ -84,8 +84,8 @@ BOT_ABOUT = os.getenv(
 )
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))  # 10 min default
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))  # Telegram bots cap ~50MB
-MP3_QUALITY = os.getenv("MP3_QUALITY", "320")  # user demands max quality: 320k every song
-TELEGRAM_AUDIO_CACHE_VERSION = "v2"
+MP3_QUALITY = os.getenv("MP3_QUALITY", "320")  # used only when stream conversion is required
+TELEGRAM_AUDIO_CACHE_VERSION = "v3"
 TELEGRAM_LOCAL_API_URL = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip()
 BASE_DIR = Path(__file__).resolve().parent
 BOT_PROFILE_PHOTO = os.getenv("BOT_PROFILE_PHOTO", "").strip()
@@ -796,6 +796,31 @@ def _probe_media_duration(path: Path) -> float | None:
         return None
 
 
+def _telegram_audio_stream(track):
+    """Prefer MP3/M4A source streams so Telegram needs no lossy re-encode."""
+    best = getattr(track, "best_audio", None)
+    streams = list(getattr(track, "audio_streams", None) or ())
+    if best is not None:
+        streams.insert(0, best)
+
+    compatible = []
+    seen = set()
+    for stream in streams:
+        url = getattr(stream, "url", None)
+        mime = str(getattr(stream, "mime_type", "")).lower()
+        if not url or id(stream) in seen:
+            continue
+        seen.add(id(stream))
+        if "mp4" in mime or "m4a" in mime or "mpeg" in mime or "mp3" in mime:
+            compatible.append(stream)
+
+    if best in compatible:
+        return best
+    if compatible:
+        return max(compatible, key=lambda stream: int(getattr(stream, "bitrate", 0) or 0))
+    return best
+
+
 def _resolve_typetube_track(target: str, cluster_host: str):
     from typetube import TypeTubeError, create_client
 
@@ -851,13 +876,17 @@ def _download_typetube_source(
 
     while True:
         try:
+            audio_stream = _telegram_audio_stream(track)
+            if not audio_stream or not getattr(audio_stream, "url", None):
+                raise RuntimeError("TypeTube did not return a Telegram-compatible audio stream.")
             started = time.perf_counter()
-            bytes_written = _download_audio_url(track.best_audio.url, source_path)
+            bytes_written = _download_audio_url(audio_stream.url, source_path)
             elapsed = time.perf_counter() - started
             average_speed = bytes_written / (1024 * 1024) / max(elapsed, 0.01)
             return (
                 client,
                 track,
+                audio_stream,
                 bytes_written,
                 average_speed,
             )
@@ -901,7 +930,14 @@ def _download_typetube_source(
                     raise RuntimeError(
                         f"TypeTube could not provide an audio stream from {next_label}."
                     ) from error
+                refreshed_audio_stream = _telegram_audio_stream(refreshed_track)
+                if not refreshed_audio_stream or not refreshed_audio_stream.url:
+                    _close_typetube_client(refreshed_client)
+                    raise RuntimeError(
+                        f"TypeTube could not provide a Telegram-compatible audio stream from {next_label}."
+                    ) from error
                 client, track = refreshed_client, refreshed_track
+                audio_stream = refreshed_audio_stream
                 cluster_host = next_host
                 current_index = next_region_index
                 break
@@ -913,7 +949,7 @@ def _download_typetube_source(
 def download_song_to_ram(
     query: str, metadata_callback=None, picked_override: dict | None = None
 ) -> dict:
-    """Resolve and download YouTube audio through TypeTube, then encode MP3."""
+    """Resolve with TypeTube and return a Telegram-ready audio stream."""
     query = str(query or "").strip()
     picked = picked_override
     if URL_RE.match(query):
@@ -1009,19 +1045,11 @@ def download_song_to_ram(
         getattr(track, "latency_ms", 0) or 0,
         video_id,
     )
-    mime_type = str(track.best_audio.mime_type or "").lower()
-    source_suffix = (
-        ".m4a" if "mp4" in mime_type or "m4a" in mime_type else
-        ".webm" if "webm" in mime_type else
-        ".ogg" if "ogg" in mime_type else
-        ".mp3" if "mpeg" in mime_type else ".audio"
-    )
-
     with tempfile.TemporaryDirectory(prefix="songbot_") as tmpdir:
-        source_path = Path(tmpdir) / f"source-{video_id}{source_suffix}"
+        source_path = Path(tmpdir) / f"source-{video_id}.audio"
         mp3_path = Path(tmpdir) / f"{video_id}.mp3"
         download_started = time.perf_counter()
-        client, track, bytes_written, average_speed = _download_typetube_source(
+        client, track, audio_stream, bytes_written, average_speed = _download_typetube_source(
             client, track, target, source_path, cluster_host
         )
         _close_typetube_client(client)
@@ -1044,24 +1072,59 @@ def download_song_to_ram(
             average_speed,
         )
 
-        transcode_started = time.perf_counter()
-        process = subprocess.run(
-            [
-                "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source_path),
-                "-vn", "-codec:a", "libmp3lame", "-b:a", f"{MP3_QUALITY}k",
-                "-threads", "0", str(mp3_path),
-            ],
-            capture_output=True,
-            timeout=120,
+        logger.info(
+            "SOURCE_STREAM mime=%s bitrate=%s",
+            audio_stream.mime_type,
+            getattr(audio_stream, "bitrate", None),
         )
-        if (
-            process.returncode
-            or not mp3_path.is_file()
-            or mp3_path.stat().st_size < 1024
-        ):
-            detail = process.stderr.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"Could not convert TypeTube audio to MP3: {detail[:200]}")
-        actual_duration = _probe_media_duration(mp3_path)
+        mime_type = str(audio_stream.mime_type or "").lower()
+        if "mp4" in mime_type or "m4a" in mime_type:
+            audio_path = source_path
+            audio_filename = f"{video_id}.m4a"
+            stream_copy_format = "m4a"
+        elif "mpeg" in mime_type or "mp3" in mime_type:
+            audio_path = source_path
+            audio_filename = f"{video_id}.mp3"
+            stream_copy_format = "mp3"
+        else:
+            audio_path = mp3_path
+            audio_filename = f"{video_id}.mp3"
+            stream_copy_format = None
+
+        transcode_started = time.perf_counter()
+        if stream_copy_format is None:
+            process = subprocess.run(
+                [
+                    "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source_path),
+                    "-vn", "-codec:a", "libmp3lame", "-b:a", f"{MP3_QUALITY}k",
+                    "-threads", "0", str(mp3_path),
+                ],
+                capture_output=True,
+                timeout=120,
+            )
+            if (
+                process.returncode
+                or not mp3_path.is_file()
+                or mp3_path.stat().st_size < 1024
+            ):
+                detail = process.stderr.decode("utf-8", errors="replace").strip()
+                raise RuntimeError(f"Could not convert TypeTube audio to MP3: {detail[:200]}")
+            transcode_seconds = time.perf_counter() - transcode_started
+            logger.info(
+                "SOURCE_TRANSCODE provider=TypeTube mode=mp3 bitrate=%sk took %.2fs",
+                MP3_QUALITY,
+                transcode_seconds,
+            )
+        else:
+            transcode_seconds = time.perf_counter() - transcode_started
+            logger.info(
+                "SOURCE_TRANSCODE provider=TypeTube mode=passthrough format=%s took %.2fs",
+                stream_copy_format,
+                transcode_seconds,
+            )
+
+        verify_started = time.perf_counter()
+        actual_duration = _probe_media_duration(audio_path)
         if actual_duration is not None and duration > 0:
             tolerance = max(2.0, duration * 0.05)
             if actual_duration + tolerance < duration:
@@ -1070,30 +1133,28 @@ def download_song_to_ram(
                     f"({actual_duration:.1f}s of {duration}s). Please retry the song."
                 )
             logger.info(
-                "SOURCE_VERIFY expected_duration=%.1fs actual_duration=%.1fs",
+                "SOURCE_VERIFY expected_duration=%.1fs actual_duration=%.1fs probe=%.2fs",
                 duration,
                 actual_duration,
+                time.perf_counter() - verify_started,
             )
-        logger.info(
-            "SOURCE_TRANSCODE provider=TypeTube bitrate=%sk took %.2fs",
-            MP3_QUALITY,
-            time.perf_counter() - transcode_started,
-        )
 
-        output_size = mp3_path.stat().st_size
+        output_size = audio_path.stat().st_size
         size_mb = output_size / (1024 * 1024)
         if MAX_FILE_MB and output_size > MAX_FILE_MB * 1024 * 1024:
             raise ValueError(
                 f"File too large ({size_mb:.1f} MB > {MAX_FILE_MB} MB). Try a shorter song."
             )
         cover_bytes = fetch_cover_jpeg(video_id)
-        if cover_bytes:
-            embed_cover_mp3(mp3_path, cover_bytes)
-        audio_bytes = mp3_path.read_bytes()
+        if cover_bytes and stream_copy_format is None:
+            embed_cover_mp3(audio_path, cover_bytes)
+            output_size = audio_path.stat().st_size
+            size_mb = output_size / (1024 * 1024)
+        audio_bytes = audio_path.read_bytes()
 
     return {
         "audio_bytes": audio_bytes,
-        "audio_filename": f"{video_id}.mp3",
+        "audio_filename": audio_filename,
         "cover_bytes": cover_bytes,
         "size_mb": size_mb,
         "title": display_title,
@@ -2103,10 +2164,18 @@ def remember_session(chat_id: int, msg_id: int, data: dict) -> None:
         SESSIONS[old].pop("original_audio_bytes", None)
 
 
-async def apply_effect(audio_bytes: bytes, effect: str, cover_bytes: bytes | None) -> bytes:
+async def apply_effect(
+    audio_bytes: bytes,
+    effect: str,
+    cover_bytes: bytes | None,
+    input_filename: str | None = None,
+) -> bytes:
     """Render an audio preset without blocking the event loop."""
     with tempfile.TemporaryDirectory(prefix="songfx_") as tmpdir:
-        src = Path(tmpdir) / "in.mp3"
+        input_suffix = Path(input_filename or "in.mp3").suffix.lower()
+        if input_suffix not in (".mp3", ".m4a"):
+            input_suffix = ".mp3"
+        src = Path(tmpdir) / f"in{input_suffix}"
         out = Path(tmpdir) / "out.mp3"
         await asyncio.to_thread(src.write_bytes, audio_bytes)
         await emyfx.render_to_path(
@@ -2505,7 +2574,10 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 effect_started = time.perf_counter()
                 out_bytes = await apply_effect(
-                    meta["audio_bytes"], default_fx, meta.get("cover_bytes")
+                    meta["audio_bytes"],
+                    default_fx,
+                    meta.get("cover_bytes"),
+                    input_filename=meta.get("audio_filename"),
                 )
                 logger.info(
                     "RENDER '%s' effect=%s took %.2fs",
@@ -3384,7 +3456,12 @@ async def run_effect(update: Update, context: ContextTypes.DEFAULT_TYPE,
             out_bytes = original_audio
         else:
             effect_started = time.perf_counter()
-            out_bytes = await apply_effect(original_audio, effect, cover_bytes)
+            out_bytes = await apply_effect(
+                original_audio,
+                effect,
+                cover_bytes,
+                input_filename=sess.get("original_audio_filename"),
+            )
             logger.info(
                 "RENDER video_id=%s effect=%s took %.2fs",
                 sess.get("video_id"), effect,
@@ -3522,7 +3599,10 @@ async def _edited_audio_bytes(
     if effect == "off":
         return original
     return await apply_effect(
-        original, effect, cover_bytes or sess.get("cover_bytes")
+        original,
+        effect,
+        cover_bytes or sess.get("cover_bytes"),
+        input_filename=sess.get("original_audio_filename"),
     )
 
 
