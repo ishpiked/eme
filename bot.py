@@ -213,6 +213,14 @@ SEARCH_RESULT_CACHE: dict[str, tuple[float, int, list[dict]]] = {}
 SEARCH_SELECTIONS: dict[str, dict] = {}
 SEARCH_RESULT_TTL = 300
 SEARCH_SELECTION_TTL = 600
+TYPE_TUBE_PREFETCH_LIMIT = max(0, int(os.getenv("TYPETUBE_PREFETCH_LIMIT", "10")))
+TYPE_TUBE_PREFETCH_TTL = 30
+TYPE_TUBE_PREFETCH_CACHE: dict[str, tuple[float, object, str]] = {}
+TYPE_TUBE_PREFETCH_INFLIGHT = {}
+TYPE_TUBE_PREFETCH_LOCK = threading.RLock()
+TYPE_TUBE_PREFETCH_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="typetube-prefetch"
+)
 
 
 def _normalize_search_query(query: str) -> str:
@@ -864,6 +872,121 @@ def _resolve_typetube_track(target: str, cluster_host: str):
         raise
 
 
+def _prefetch_typetube_track(video_id: str, target: str):
+    """Resolve a visible search result ahead of the user's selection."""
+    client = None
+    started = time.perf_counter()
+    try:
+        last_region_error = None
+        for region_label, candidate_host in owner.TYPE_TUBE_CLUSTERS:
+            try:
+                client, track = _resolve_typetube_track(target, candidate_host)
+                cluster_host = candidate_host
+                break
+            except (TypeTubeOwnerKeyUnavailable, TypeTubeSDKVersionError):
+                raise
+            except TypeTubeFreeQuotaExhausted as error:
+                last_region_error = error
+                logger.debug(
+                    "TypeTube prefetch public access unavailable in %s.",
+                    region_label,
+                )
+            except Exception as error:
+                last_region_error = error
+                logger.debug(
+                    "TypeTube prefetch resolve failed in %s (%s).",
+                    region_label, type(error).__name__,
+                )
+        else:
+            raise RuntimeError(
+                "TypeTube could not pre-resolve this result from its available regions."
+            ) from last_region_error
+
+        track_id = youtube.get_video_id(str(getattr(track, "id", "") or ""))
+        if (
+            not getattr(track, "success", False)
+            or track_id != video_id
+            or not getattr(track, "best_audio", None)
+            or not getattr(track.best_audio, "url", None)
+        ):
+            raise RuntimeError("TypeTube returned an invalid prefetched audio track.")
+        return track, cluster_host, (time.perf_counter() - started) * 1000
+    finally:
+        _close_typetube_client(client)
+
+
+def _store_prefetched_typetube_track(video_id: str, future) -> None:
+    try:
+        track, cluster_host, elapsed_ms = future.result()
+    except Exception as error:
+        logger.debug(
+            "TypeTube prefetch failed id=%s (%s).",
+            video_id, type(error).__name__,
+        )
+    else:
+        now = time.monotonic()
+        with TYPE_TUBE_PREFETCH_LOCK:
+            TYPE_TUBE_PREFETCH_CACHE[video_id] = (
+                now + TYPE_TUBE_PREFETCH_TTL, track, cluster_host
+            )
+            for cached_id, cached in list(TYPE_TUBE_PREFETCH_CACHE.items()):
+                if cached[0] <= now:
+                    TYPE_TUBE_PREFETCH_CACHE.pop(cached_id, None)
+            while len(TYPE_TUBE_PREFETCH_CACHE) > 128:
+                TYPE_TUBE_PREFETCH_CACHE.pop(next(iter(TYPE_TUBE_PREFETCH_CACHE)))
+        logger.info(
+            "SOURCE_PREFETCH provider=TypeTube id=%s took=%.0fms ttl=%ds",
+            video_id, elapsed_ms, TYPE_TUBE_PREFETCH_TTL,
+        )
+    finally:
+        with TYPE_TUBE_PREFETCH_LOCK:
+            if TYPE_TUBE_PREFETCH_INFLIGHT.get(video_id) is future:
+                TYPE_TUBE_PREFETCH_INFLIGHT.pop(video_id, None)
+
+
+def _schedule_typetube_prefetch(candidates: list[dict]) -> None:
+    """Resolve up to the visible page size without delaying the search UI."""
+    if TYPE_TUBE_PREFETCH_LIMIT <= 0:
+        return
+    for candidate in candidates[:TYPE_TUBE_PREFETCH_LIMIT]:
+        try:
+            video_id = youtube.get_video_id(str(candidate.get("id") or ""))
+        except youtube.YouTubeError:
+            continue
+        target = f"https://www.youtube.com/watch?v={video_id}"
+        now = time.monotonic()
+        with TYPE_TUBE_PREFETCH_LOCK:
+            cached = TYPE_TUBE_PREFETCH_CACHE.get(video_id)
+            if cached and cached[0] > now:
+                continue
+            if cached:
+                TYPE_TUBE_PREFETCH_CACHE.pop(video_id, None)
+            if video_id in TYPE_TUBE_PREFETCH_INFLIGHT:
+                continue
+            future = TYPE_TUBE_PREFETCH_EXECUTOR.submit(
+                _prefetch_typetube_track, video_id, target
+            )
+            TYPE_TUBE_PREFETCH_INFLIGHT[video_id] = future
+            future.add_done_callback(
+                lambda completed, key=video_id:
+                    _store_prefetched_typetube_track(key, completed)
+            )
+
+
+def _get_prefetched_typetube_track(video_id: str | None):
+    if not video_id:
+        return None
+    now = time.monotonic()
+    with TYPE_TUBE_PREFETCH_LOCK:
+        cached = TYPE_TUBE_PREFETCH_CACHE.get(video_id)
+        if not cached:
+            return None
+        if cached[0] <= now:
+            TYPE_TUBE_PREFETCH_CACHE.pop(video_id, None)
+            return None
+        return cached[1], cached[2]
+
+
 def _download_typetube_source(
     client, track, target: str, source_path: Path, cluster_host: str
 ):
@@ -952,6 +1075,7 @@ def download_song_to_ram(
     """Resolve with TypeTube and return a Telegram-ready audio stream."""
     query = str(query or "").strip()
     picked = picked_override
+    prefetched_video_id = None
     if URL_RE.match(query):
         if not recognition.validate_media_url(query):
             raise ValueError("Use a supported public YouTube link.")
@@ -969,37 +1093,50 @@ def download_song_to_ram(
                 "No confident matching track was found. Try including the artist or version."
             )
         video_id = youtube.get_video_id(str(picked["id"]))
+        prefetched_video_id = video_id
         target = f"https://www.youtube.com/watch?v={video_id}"
 
     resolve_started = time.perf_counter()
-    client = track = cluster_host = None
-    last_region_error = None
-    for region_label, candidate_host in owner.TYPE_TUBE_CLUSTERS:
-        try:
-            client, track = _resolve_typetube_track(target, candidate_host)
-            cluster_host = candidate_host
-            break
-        except TypeTubeOwnerKeyUnavailable:
-            raise
-        except TypeTubeSDKVersionError:
-            raise
-        except TypeTubeFreeQuotaExhausted as error:
-            last_region_error = error
-            logger.warning(
-                "TypeTube public access is unavailable in %s; trying the next region.",
-                region_label,
-            )
-        except Exception as error:
-            last_region_error = error
-            logger.warning(
-                "TypeTube resolve failed in %s (%s); trying the next region.",
-                region_label, type(error).__name__,
-            )
-    if client is None or track is None or cluster_host is None:
-        raise RuntimeError(
-            "TypeTube could not resolve this track from its available regions."
-        ) from last_region_error
-    resolve_seconds = time.perf_counter() - resolve_started
+    prefetched = _get_prefetched_typetube_track(prefetched_video_id)
+    if prefetched:
+        track, cluster_host = prefetched
+        client = None
+        resolve_seconds = time.perf_counter() - resolve_started
+        logger.info(
+            "SOURCE_RESOLVE_CACHE_HIT provider=TypeTube region=%s took=%.1fms id=%s",
+            next(label for label, host in owner.TYPE_TUBE_CLUSTERS if host == cluster_host),
+            resolve_seconds * 1000,
+            prefetched_video_id,
+        )
+    else:
+        client = track = cluster_host = None
+        last_region_error = None
+        for region_label, candidate_host in owner.TYPE_TUBE_CLUSTERS:
+            try:
+                client, track = _resolve_typetube_track(target, candidate_host)
+                cluster_host = candidate_host
+                break
+            except TypeTubeOwnerKeyUnavailable:
+                raise
+            except TypeTubeSDKVersionError:
+                raise
+            except TypeTubeFreeQuotaExhausted as error:
+                last_region_error = error
+                logger.warning(
+                    "TypeTube public access is unavailable in %s; trying the next region.",
+                    region_label,
+                )
+            except Exception as error:
+                last_region_error = error
+                logger.warning(
+                    "TypeTube resolve failed in %s (%s); trying the next region.",
+                    region_label, type(error).__name__,
+                )
+        if client is None or track is None or cluster_host is None:
+            raise RuntimeError(
+                "TypeTube could not resolve this track from its available regions."
+            ) from last_region_error
+        resolve_seconds = time.perf_counter() - resolve_started
     if (
         not getattr(track, "success", False)
         or not getattr(track, "id", None)
@@ -2385,6 +2522,7 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "page": 0,
         }
         SEARCH_SELECTIONS[selection_token] = selection
+        _schedule_typetube_prefetch(candidates[:SEARCH_PAGE_SIZE])
         while len(SEARCH_SELECTIONS) > 256:
             oldest = min(
                 SEARCH_SELECTIONS,
@@ -3210,6 +3348,10 @@ async def _search_navigation_callback(query) -> None:
         return
 
     selection["page"] = page
+    page_start = page * SEARCH_PAGE_SIZE
+    _schedule_typetube_prefetch(
+        selection["candidates"][page_start:page_start + SEARCH_PAGE_SIZE]
+    )
     try:
         await query.edit_message_text(
             search_results_text(selection),

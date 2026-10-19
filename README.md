@@ -45,6 +45,7 @@ Playlists are available to every user in a private chat; they are not owner-only
 | `BOT_PROFILE_PHOTO` | none | Optional local JPEG file for the bot profile photo |
 | `MAX_DURATION_SEC` | `600` | Reject songs longer than this (also saves RAM) |
 | `MAX_FILE_MB` | `49` | Telegram Bot API ~50MB limit (also RAM cap) |
+| `TYPETUBE_PREFETCH_LIMIT` | `10` | Visible results to resolve in the background (each uses a TypeTube request; set `0` to disable) |
 | `TELEGRAM_LOCAL_API_URL` | unset | Optional Local Bot API server origin, e.g. `http://127.0.0.1:8081` |
 | `BOT_DATA_DIR` | OS user config directory | Private storage for bot state |
 | `BOT_DATABASE_FILE` | `<BOT_DATA_DIR>/bot-state.sqlite3` | Optional user, playlist, and broadcast database override |
@@ -57,7 +58,7 @@ Playlists are available to every user in a private chat; they are not owner-only
 4. Audio is held in temporary working files during download/conversion, read into RAM for upload, and the temporary directory is removed at the end of processing.
 5. The bot uploads the MP3/M4A audio to Telegram and retains the untouched source only in a bounded in-memory effect session. Per-user effect settings are stored in `user.json`; owner/broadcast state and Telegram audio file IDs are stored outside the project by default.
 - The bot stores up to 2,048 Telegram `file_id` entries in its SQLite database, keyed by video, output quality, and effect. Replays of a known video reuse Telegram's stored audio and skip TypeTube, FFmpeg, and the full audio upload. The cache stores IDs and display metadata, not local audio files. Download and conversion work files are temporary and removed when processing finishes.
-- The bot keeps search-result metadata in memory for five minutes. TypeTube resolves a fresh stream on a cache miss. Stream URLs are not cached.
+- The bot keeps search-result metadata in memory for five minutes and pre-resolves the visible result page in the background. Resolved stream details stay in memory for 30 seconds, so selecting one after it is ready avoids the TypeTube network round trip. This uses one TypeTube resolve request per visible result; set `TYPETUBE_PREFETCH_LIMIT=0` to turn it off. Signed stream URLs are never written to disk.
 - Telegram inline mode uses the player's direct audio-only MP4 streams for text searches, YouTube links, and 11-character video IDs. Telegram fetches the signed YouTube URL itself rather than sending the audio through the bot; the available quality is whatever YouTube exposes, and a signed URL may expire or be inaccessible to Telegram. Enable inline mode with BotFather's `/setinline`. Inline answers are not cached.
 
 ### Audio effects and transfer timings
