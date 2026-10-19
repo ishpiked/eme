@@ -6,12 +6,14 @@ warnings.filterwarnings("ignore", message=r".*match a supported version.*")
 
 import asyncio
 import html
+import http.client
 import io
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -19,6 +21,7 @@ import time
 from types import SimpleNamespace
 import urllib.request
 import urllib.error
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -667,6 +670,97 @@ class _InvalidRangeResponse(Exception):
     """Raised when a media server ignores or misreports an HTTP byte range."""
 
 
+class _IPv4HTTPConnection(http.client.HTTPConnection):
+    def connect(self) -> None:
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect((self.host, self.port))
+
+
+class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+    def connect(self) -> None:
+        raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        raw_sock.settimeout(self.timeout)
+        raw_sock.connect((self.host, self.port))
+        server_hostname = self.host if not self._tunnel_host else self._tunnel_host
+        self.sock = self._context.wrap_socket(raw_sock, server_hostname=server_hostname)
+
+
+class _AudioHTTPResponse:
+    def __init__(self, connection, response):
+        self.connection = connection
+        self.response = response
+        self.headers = response.headers
+
+    def getcode(self) -> int:
+        return self.response.status
+
+    def read(self, size: int = -1) -> bytes:
+        return self.response.read(size)
+
+    def close(self) -> None:
+        try:
+            self.response.close()
+        finally:
+            self.connection.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+def _open_typetube_audio_request(url: str, headers: dict, timeout: int):
+    """Open a stream request using TypeTube's IPv4/IPv6 selection behavior."""
+    current_url = url
+    for _ in range(5):
+        parsed = urllib.parse.urlsplit(current_url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("TypeTube returned an unsupported audio URL.")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        query = urllib.parse.parse_qs(parsed.query)
+        ip_hint = query.get("ip", [""])[0]
+        use_ipv4 = ":" not in ip_hint
+        if parsed.scheme == "https":
+            connection_type = _IPv4HTTPSConnection if use_ipv4 else http.client.HTTPSConnection
+        else:
+            connection_type = _IPv4HTTPConnection if use_ipv4 else http.client.HTTPConnection
+        connection = connection_type(parsed.hostname, port, timeout=timeout)
+        request_headers = dict(headers)
+        request_headers["Host"] = parsed.hostname
+        try:
+            connection.request("GET", path, headers=request_headers)
+            response = connection.getresponse()
+            if response.status in (301, 302, 303, 307, 308):
+                location = response.getheader("Location")
+                if location:
+                    response.read()
+                    current_url = urllib.parse.urljoin(current_url, location)
+                    connection.close()
+                    continue
+            if response.status >= 400:
+                status, reason, response_headers = (
+                    response.status, response.reason, response.headers
+                )
+                response.read()
+                connection.close()
+                raise urllib.error.HTTPError(
+                    current_url, status, reason, response_headers, None
+                )
+            return _AudioHTTPResponse(connection, response)
+        except Exception:
+            connection.close()
+            raise
+        finally:
+            # Redirects close before following; successful responses are closed
+            # by _AudioHTTPResponse after their body has been consumed.
+            if connection.sock is None:
+                connection.close()
+    raise urllib.error.URLError("Too many redirects while fetching TypeTube audio.")
+
+
 def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
     match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", (value or "").strip(), re.I)
     if not match:
@@ -677,7 +771,7 @@ def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
 def _download_audio_url(url: str, destination: Path) -> int:
     """Download all bytes, falling back to one stream if range support is bad."""
     headers = {
-        "User-Agent": "Mozilla/5.0",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/128.0.0.0",
         "Accept-Encoding": "identity",
     }
 
@@ -685,8 +779,7 @@ def _download_audio_url(url: str, destination: Path) -> int:
         request_headers = dict(headers)
         if range_header:
             request_headers["Range"] = range_header
-        request = urllib.request.Request(url, headers=request_headers)
-        return urllib.request.urlopen(request, timeout=60)
+        return _open_typetube_audio_request(url, request_headers, timeout=60)
 
     def download_linear(expected_size: int | None = None) -> int:
         downloaded = 0
@@ -1020,6 +1113,18 @@ def _download_typetube_source(
             if status_code != 403:
                 _close_typetube_client(client)
                 raise
+            try:
+                rejected_host = urllib.parse.urlsplit(audio_stream.url).hostname or "unknown"
+            except (TypeError, ValueError):
+                rejected_host = "unknown"
+            region_name = next(
+                (label for label, host in owner.TYPE_TUBE_CLUSTERS if host == cluster_host),
+                "unknown",
+            )
+            logger.warning(
+                "TypeTube audio request returned 403 in region=%s host=%s; refreshing through the next region.",
+                region_name, rejected_host,
+            )
             _close_typetube_client(client)
             source_path.unlink(missing_ok=True)
             next_region_index = current_index + 1
@@ -1065,6 +1170,9 @@ def _download_typetube_source(
                 current_index = next_region_index
                 break
             else:
+                logger.error(
+                    "TypeTube audio URL returned 403 in every available cluster."
+                )
                 raise
     raise RuntimeError("TypeTube audio download failed after refreshing the stream.")
 
