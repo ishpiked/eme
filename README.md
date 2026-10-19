@@ -19,7 +19,7 @@ Playlists are available to every user in a private chat; they are not owner-only
 
 ## Setup
 1. Create a bot with [@BotFather](https://t.me/BotFather), copy the token, and enable inline mode with `/setinline` if you want `@botname song` results.
-2. Install Python 3.11 or newer, ffmpeg, and a JavaScript runtime such as Deno for yt-dlp's current YouTube challenge handling.
+2. Install Python 3.10 or newer and ffmpeg. TypeTube handles YouTube stream resolution and audio downloads.
 3. Install deps:
    ```powershell
    pip install --upgrade -r requirements.txt
@@ -48,25 +48,27 @@ Playlists are available to every user in a private chat; they are not owner-only
 | `TELEGRAM_LOCAL_API_URL` | unset | Optional Local Bot API server origin, e.g. `http://127.0.0.1:8081` |
 | `BOT_DATA_DIR` | OS user config directory | Private storage for bot state |
 | `BOT_DATABASE_FILE` | `<BOT_DATA_DIR>/bot-state.sqlite3` | Optional user, playlist, and broadcast database override |
+| `TYPETUBE_KEY_FILE` | `<BOT_DATA_DIR>/typetube-api-key` | Optional private fallback key file; `/apikey` can configure the key |
 
-## How it works (temporary media, no persistent audio cache)
+## How it works (temporary media with Telegram file reuse)
 1. **Track search**: Search results are parsed from YouTube's public `/results` page, in relevance order. Results are cached in memory for five minutes; a consent page, changed markup, or rate limit is reported as a search error.
-2. Song downloads use yt-dlp's YouTube extractor to select and download the best available audio, then its FFmpeg audio postprocessor extracts MP3 at `MP3_QUALITY` (320 kbps by default). Install the `yt-dlp[default]` extra and a JavaScript runtime such as Deno to help yt-dlp handle YouTube's changing player challenges; YouTube can still deny media access to some server IPs. The bot's own YouTube results-page parser remains responsible for search; player resolution and direct HTTP range downloads are not used for normal song playback.
+2. TypeTube resolves and downloads through regional clusters, trying the Netherlands first, then Singapore and India on a regional 403. FFmpeg converts the selected audio to MP3 at `MP3_QUALITY` (320 kbps by default). TypeTube public access is tried first; an owner can configure a private fallback key with `/apikey` if required.
 3. Recognition extracts a 10-second audio sample from the start of the uploaded file or YouTube preview (uploads/previews are limited to 20 MiB) and submits it to the unauthenticated ShazamIO recognition service. Recognition is best-effort and can fail for intros, unclear audio, provider outages, or tracks Shazam does not identify.
 4. Audio is held in temporary working files during download/conversion, read into RAM for upload, and the temporary directory is removed at the end of processing.
-5. Bot sends the bytes through Telegram's `InputFile` and retains the untouched source audio only in a bounded in-memory effect session. Per-user effect settings are stored in `user.json`; owner/broadcast state is stored outside the project by default.
-- No local song or Telegram `file_id` playback cache is read or written. The bot keeps search-result metadata in memory for five minutes, but yt-dlp fetches fresh extraction metadata and media for every playback. yt-dlp's own cache is disabled; download and conversion work files are temporary and removed when processing finishes.
+5. Bot uploads the converted MP3 to Telegram and retains the untouched source audio only in a bounded in-memory effect session. Per-user effect settings are stored in `user.json`; owner/broadcast state and Telegram audio file IDs are stored outside the project by default.
+- The bot stores up to 2,048 Telegram `file_id` entries in its SQLite database, keyed by video, output quality, and effect. Replays of a known video reuse Telegram's stored audio and skip TypeTube, FFmpeg, and the full audio upload. The cache stores IDs and display metadata, not local audio files. Download and conversion work files are temporary and removed when processing finishes.
+- The bot keeps search-result metadata in memory for five minutes. TypeTube resolves a fresh stream on a cache miss. Stream URLs are not cached.
 - Telegram inline mode uses the player's direct audio-only MP4 streams for text searches, YouTube links, and 11-character video IDs. Telegram fetches the signed YouTube URL itself rather than sending the audio through the bot; the available quality is whatever YouTube exposes, and a signed URL may expire or be inaccessible to Telegram. Enable inline mode with BotFather's `/setinline`. Inline answers are not cached.
 
 ### Audio effects and transfer timings
 - The Effect menu and `/settings` use the FFmpeg presets in `emyfx.py`: 8D, 360°, 3D, Concert, Slowed, Vinyl, LoFi, Phonk, and Dreamy. Phonk shapes the source's bass and transients with controlled saturation; it does not generate or randomize beats. Dreamy adds filtered, spacious reflections over the original signal. Headphones are recommended for spatial effects.
 - Changing a song's name, artist, cover, or effect replaces the media on the existing Telegram message. Effects always render from the untouched source audio; choosing another preset never layers effects, and the active preset's button becomes **Original** to restore the unprocessed track.
 - Song search requests up to 25 YouTube results in a background thread; search results are cached in memory for five minutes, including partial result sets, so repeat searches do not refetch just because fewer than the requested maximum were available.
-- The bot logs catalog search, yt-dlp download/MP3 postprocessing, effect rendering, Telegram upload request and stage duration, effective payload rate, and total request time when the corresponding phase occurs. Initial playback still depends on catalog/provider response time, file size, and Telegram's upload/processing speed; no bot can guarantee a fixed 2–3 second upload for a full-length track.
+- The bot logs catalog search, TypeTube resolve/download, MP3 conversion, effect rendering, Telegram upload request and stage duration, effective payload rate, cache hits, and total request time when the corresponding phase occurs. First playback still depends on catalog/provider response time, file size, and Telegram's upload/processing speed; no bot can transfer a full song in milliseconds.
 - The bot processes up to eight Telegram updates concurrently so a long download or effect render does not hold up unrelated messages and button callbacks. Effect presets that do not use source duration skip the extra FFprobe subprocess; Vinyl and LoFi retain the duration probe required to size their texture sources.
-- `YTDLP_CONCURRENT_FRAGMENTS` controls yt-dlp's bounded fragment-download concurrency (default 16, maximum 16). It can help segmented media when the server/network supports parallel fragments, but does not accelerate progressive single-stream downloads or Telegram uploads. Use the transfer benchmark below to identify the actual bottleneck; VPS bandwidth alone cannot guarantee Telegram throughput.
+- TypeTube audio downloads use up to 16 parallel range workers. Region-restricted 403 responses cause the bot to resolve and download again through the next supported cluster: Netherlands, Singapore, then India.
 - Telegram's Bot API returns only after it has accepted and processed an upload; it does not expose a separate server processing duration. The logged request duration therefore includes both network transfer and Telegram processing and must not be interpreted as client side upload time alone.
-- YouTube's public results page supplies search results. yt-dlp handles song downloads and MP3 extraction; the player endpoint is still used by inline audio, previews, and recognition, which require direct stream URLs.
+- YouTube's public results page supplies song search results. TypeTube resolves and downloads selected audio; the player endpoint remains in use for inline audio, previews, and recognition.
 - The bot reuses its configured `HTTPXRequest` connection pool for Telegram API calls.
 - To measure Telegram transfer performance independently of YouTube search and FFmpeg, set `BENCHMARK_CHAT_ID` to a chat where the bot can send messages, then run `python transfer.py`. It sends and deletes synthetic 1, 5, 10, and 15 MB documents (decimal), verifies their SHA-256 hashes, and logs upload/download times and effective throughput. It uses `TELEGRAM_LOCAL_API_URL` when configured. Timings include Bot API processing because Telegram does not expose the raw network-transfer interval.
 
@@ -92,15 +94,15 @@ Playlists are available to every user in a private chat; they are not owner-only
 - Owner commands are silent for other users, including when invoked outside a private chat.
 
 ## Realistic latency
-Fresh playback always resolves, downloads, converts, and uploads the audio; repeats take the same path. A 320 kbps MP3 is about 2.4 MB per minute before metadata, so even on a 2.5 Gbps VPS the end-to-end time depends on YouTube's response/CDN, transcoding, Telegram's upload path and processing, and network latency. A 2–3 second end-to-end guarantee for full songs cannot be made from the VPS's link speed alone. Search results are cached in process memory for five minutes to skip repeat search-page requests; stream URLs are never cached.
+First playback still resolves, downloads, converts, and uploads the audio. Replays with the same video, quality, and effect reuse Telegram's stored file ID and avoid moving the audio through the bot again. A 320 kbps MP3 is about 2.4 MB per minute before metadata, so first-play time depends on provider response, transcoding, Telegram processing, and network latency; a full-length song cannot be transferred in milliseconds. Search results are cached in process memory for five minutes; signed stream URLs are not cached.
 
 ## Notes
-- Audio working files are temporary and deleted after processing; no downloaded music is persisted as a local cache.
+- Audio working files are temporary and deleted after processing. The persistent playback cache stores Telegram file IDs and metadata only, not downloaded music.
 - YouTube player responses can change or withhold direct stream URLs; private, restricted, or cipher-only streams may not be available.
 
 ## Requirements
 - Python 3.10+ recommended.
-- yt-dlp required for song downloads (`pip install -r requirements.txt`).
+- TypeTube 1.1.3 is required for regional cluster routing (`pip install -r requirements.txt`).
 - ffmpeg required for MP3 conversion.
 
 ## Troubleshooting

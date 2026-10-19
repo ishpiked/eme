@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import sqlite3
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,11 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 logger = logging.getLogger(__name__)
 
 OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)
+TYPE_TUBE_CLUSTERS = (
+    ("Netherlands", "tap://nl.clusters.typetube.xyz"),
+    ("Singapore", "tap://sg.clusters.typetube.xyz"),
+    ("India", "tap://in.clusters.typetube.xyz"),
+)
 BROADCAST_MAX_BUTTONS = 10
 BROADCAST_MAX_BUTTONS_PER_ROW = 2
 BROADCAST_MAX_ROWS = 5
@@ -43,6 +49,41 @@ DATA_DIR = _data_dir()
 DATABASE_FILE = Path(
     os.getenv("BOT_DATABASE_FILE", str(DATA_DIR / "bot-state.sqlite3"))
 ).expanduser()
+TYPE_TUBE_KEY_FILE = Path(
+    os.getenv("TYPETUBE_KEY_FILE", str(DATA_DIR / "typetube-api-key"))
+).expanduser()
+
+
+def get_typetube_api_key() -> str | None:
+    try:
+        value = TYPE_TUBE_KEY_FILE.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        logger.exception("Could not read the TypeTube credential file.")
+        raise
+    return value or None
+
+
+def _save_api_key(value: str) -> None:
+    TYPE_TUBE_KEY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+        prefix="typetube-key-", dir=TYPE_TUBE_KEY_FILE.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        if os.name != "nt":
+            os.chmod(temporary, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as key_file:
+            key_file.write(value)
+            key_file.flush()
+            os.fsync(key_file.fileno())
+        temporary.replace(TYPE_TUBE_KEY_FILE)
+        if os.name != "nt":
+            os.chmod(TYPE_TUBE_KEY_FILE, 0o600)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _keyboard(*rows: list[InlineKeyboardButton]) -> InlineKeyboardMarkup:
@@ -123,6 +164,17 @@ class OwnerConsole:
                     UNIQUE(playlist_id, song_key),
                     FOREIGN KEY (playlist_id) REFERENCES playlists(id)
                 );
+                CREATE TABLE IF NOT EXISTS telegram_audio_cache (
+                    video_id TEXT NOT NULL,
+                    variant TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    base_title TEXT NOT NULL,
+                    performer TEXT,
+                    duration INTEGER,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY (video_id, variant)
+                );
                 CREATE INDEX IF NOT EXISTS users_last_seen_idx
                     ON users(last_seen);
                 CREATE INDEX IF NOT EXISTS broadcast_recipient_status_idx
@@ -168,6 +220,60 @@ class OwnerConsole:
                 return int(cursor.lastrowid)
         except sqlite3.IntegrityError as error:
             raise ValueError("You already have a playlist with that name.") from error
+
+    def get_cached_audio(self, video_id: str, variant: str) -> dict | None:
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT file_id, title, base_title, performer, duration "
+                "FROM telegram_audio_cache WHERE video_id=? AND variant=?",
+                (video_id, variant),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def cache_audio(
+        self,
+        video_id: str,
+        variant: str,
+        *,
+        file_id: str,
+        title: str,
+        base_title: str,
+        performer: str | None,
+        duration: int | None,
+    ) -> None:
+        with self._connect() as db:
+            db.execute(
+                """
+                INSERT INTO telegram_audio_cache (
+                    video_id, variant, file_id, title, base_title,
+                    performer, duration, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(video_id, variant) DO UPDATE SET
+                    file_id=excluded.file_id,
+                    title=excluded.title,
+                    base_title=excluded.base_title,
+                    performer=excluded.performer,
+                    duration=excluded.duration,
+                    created_at=excluded.created_at
+                """,
+                (
+                    video_id, variant, file_id, title, base_title,
+                    performer, duration,
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+            db.execute(
+                "DELETE FROM telegram_audio_cache WHERE rowid NOT IN "
+                "(SELECT rowid FROM telegram_audio_cache "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 2048)"
+            )
+
+    def delete_cached_audio(self, video_id: str, variant: str) -> None:
+        with self._connect() as db:
+            db.execute(
+                "DELETE FROM telegram_audio_cache WHERE video_id=? AND variant=?",
+                (video_id, variant),
+            )
 
     def list_playlists(self, user_id: int) -> list[dict]:
         with self._connect() as db:
@@ -352,6 +458,10 @@ class OwnerConsole:
                     style=KeyboardButtonStyle.PRIMARY,
                 ),
                 InlineKeyboardButton(
+                    "TypeTube API key", callback_data="owner:apikey",
+                    style=KeyboardButtonStyle.PRIMARY,
+                ),
+                InlineKeyboardButton(
                     "Compose broadcast", callback_data="owner:broadcast:start",
                     style=KeyboardButtonStyle.SUCCESS,
                 ),
@@ -361,6 +471,36 @@ class OwnerConsole:
                 ),
             ]),
         )
+
+    async def apikey_command(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ) -> None:
+        message = update.effective_message
+        if not message or not await self._require_owner_private(update):
+            return
+        if context.args and context.args[0].lower() in ("remove", "delete"):
+            try:
+                TYPE_TUBE_KEY_FILE.unlink(missing_ok=True)
+            except OSError as error:
+                logger.exception("Could not remove the TypeTube API key.")
+                await message.reply_text(f"Could not remove the API key: {error}")
+            else:
+                await message.reply_text("TypeTube API key removed.")
+            return
+        await self._prompt_for_api_key(message)
+
+    async def _prompt_for_api_key(self, message) -> None:
+        prompt = await message.reply_text(
+            "<b>TypeTube API key</b>\n\n"
+            "Send your private key here. It will be verified before it is saved.\n\n"
+            "Use <code>/cancel</code> to abort.",
+            parse_mode="HTML",
+        )
+        self.awaiting[self.owner_id] = {
+            "kind": "api_key",
+            "prompt_chat_id": prompt.chat_id,
+            "prompt_message_id": prompt.message_id,
+        }
 
     async def stats_command(
         self, update: Update, context: ContextTypes.DEFAULT_TYPE
@@ -492,6 +632,57 @@ class OwnerConsole:
         if not pending or not message:
             return
         kind = pending.get("kind")
+        if kind == "api_key":
+            key = (message.text or "").strip()
+            try:
+                if not key or len(key) > 4096 or any(char.isspace() for char in key):
+                    raise ValueError("The API key must be a non-empty single-line value.")
+                from typetube import create_client
+
+                def validate_key() -> None:
+                    last_error = None
+                    for _, cluster_host in TYPE_TUBE_CLUSTERS:
+                        client = create_client(
+                            api_key=key,
+                            host=cluster_host,
+                            port=8443,
+                            timeout_ms=10000,
+                        )
+                        try:
+                            client.ping()
+                            return
+                        except Exception as error:
+                            last_error = error
+                        finally:
+                            client.close()
+                    if last_error:
+                        raise last_error
+                    raise ValueError("TypeTube did not validate this API key.")
+
+                await asyncio.to_thread(validate_key)
+                _save_api_key(key)
+            except Exception as error:
+                logger.warning("TypeTube API key validation failed: %s", type(error).__name__)
+                await message.reply_text("Could not verify or save the TypeTube API key.")
+            else:
+                await message.reply_text("TypeTube API key saved.")
+            finally:
+                prompt_chat_id = pending.get("prompt_chat_id")
+                prompt_message_id = pending.get("prompt_message_id")
+                self.awaiting.pop(user.id, None)
+                if prompt_chat_id and prompt_message_id:
+                    try:
+                        await context.bot.delete_message(
+                            chat_id=prompt_chat_id,
+                            message_id=prompt_message_id,
+                        )
+                    except TelegramError as error:
+                        logger.warning("Could not delete TypeTube key prompt: %s", error)
+                try:
+                    await message.delete()
+                except TelegramError as error:
+                    logger.warning("Could not delete submitted TypeTube key: %s", error)
+            raise ApplicationHandlerStop
         if kind == "broadcast_content":
             content_type = "text" if message.text is not None else "media"
             rich_text = (

@@ -1,4 +1,4 @@
-"""Resolve and download direct YouTube player streams without yt-dlp."""
+"""Resolve and download direct YouTube player streams."""
 
 from __future__ import annotations
 
@@ -47,7 +47,7 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 )
 DOWNLOAD_WORKERS = 16
-DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024
+DOWNLOAD_CHUNK_SIZE = 1 * 1024 * 1024
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _AUDIO_CODEC_RE = re.compile(r"(?:mp4a|opus|vorbis|aac|mp3|alac|flac)", re.I)
 SEARCH_TIMEOUT = 12
@@ -540,6 +540,24 @@ def _download_range(url: str, start: int, end: int, total: int) -> bytes:
     return data
 
 
+def _probe_content_length(url: str) -> int:
+    """Get a stream length with a one-byte range request when available."""
+    request = urllib.request.Request(
+        url, headers=_request_headers(0, 0)
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            content_range = response.headers.get("Content-Range", "")
+            if "/" in content_range:
+                return _integer(content_range.rsplit("/", 1)[1])
+            # A server may ignore Range but still report the full object size.
+            if response.status == 200:
+                return _integer(response.headers.get("Content-Length"))
+    except Exception as error:
+        logger.debug("Could not probe stream length: %s", type(error).__name__)
+    return 0
+
+
 def download_format(
     stream: dict,
     destination: Path,
@@ -553,6 +571,8 @@ def download_format(
         total = int(stream.get("contentLength") or 0)
     except (TypeError, ValueError):
         total = 0
+    if total <= 0:
+        total = _probe_content_length(url)
     if max_bytes and total > max_bytes:
         raise YouTubeError(
             f"Stream exceeds the {max_bytes // (1024 * 1024)} MB limit."
@@ -591,7 +611,7 @@ def download_format(
 
     elapsed = max(time.perf_counter() - started, 0.001)
     logger.info(
-        "YOUTUBE_DOWNLOAD bytes=%d workers=%d elapsed=%.2fs rate=%.2fMiB/s",
+        "STREAM_DOWNLOAD bytes=%d workers=%d elapsed=%.2fs rate=%.2fMiB/s",
         size,
         min(DOWNLOAD_WORKERS, max(1, (total + DOWNLOAD_CHUNK_SIZE - 1) // DOWNLOAD_CHUNK_SIZE)),
         elapsed,

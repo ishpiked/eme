@@ -14,14 +14,15 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from types import SimpleNamespace
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-import yt_dlp
 from dotenv import load_dotenv
 from telegram import (
     BotCommand,
@@ -37,7 +38,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ChatAction
-from telegram.error import TelegramError, TimedOut
+from telegram.error import BadRequest, TelegramError, TimedOut
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -84,9 +85,7 @@ BOT_ABOUT = os.getenv(
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))  # 10 min default
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))  # Telegram bots cap ~50MB
 MP3_QUALITY = os.getenv("MP3_QUALITY", "320")  # user demands max quality: 320k every song
-YTDLP_CONCURRENT_FRAGMENTS = min(
-    16, max(1, int(os.getenv("YTDLP_CONCURRENT_FRAGMENTS", "16")))
-)
+TELEGRAM_AUDIO_CACHE_VERSION = "v2"
 TELEGRAM_LOCAL_API_URL = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip()
 BASE_DIR = Path(__file__).resolve().parent
 BOT_PROFILE_PHOTO = os.getenv("BOT_PROFILE_PHOTO", "").strip()
@@ -517,13 +516,36 @@ async def inline_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+class TypeTubeFreeQuotaExhausted(RuntimeError):
+    """Raised when public TypeTube quota is spent and no owner key is saved."""
+
+
+class TypeTubeOwnerKeyUnavailable(RuntimeError):
+    """Raised when the owner's private TypeTube key cannot serve requests."""
+
+
+class TypeTubeSDKVersionError(RuntimeError):
+    """Raised when an old TypeTube package cannot speak to TAP clusters."""
+
+
 def friendly_error(e: BaseException) -> str:
     msg = ANSI_RE.sub("", str(e)).strip()
     low = msg.lower()
+    if isinstance(e, TypeTubeSDKVersionError):
+        return msg
+    if isinstance(e, (TypeTubeFreeQuotaExhausted, TypeTubeOwnerKeyUnavailable)):
+        return "Song downloads are temporarily unavailable. Please try again later."
     if isinstance(e, youtube.YouTubeError):
         return msg[:400]
     if isinstance(e, urllib.error.HTTPError) and e.code == 403:
         return "The audio source temporarily refused the download. Please try again."
+    if type(e).__module__.startswith("typetube") or any(
+        marker in low
+        for marker in (
+            "api key", "unauthorized", "quota", "daily limit", "rate limit", "typetube"
+        )
+    ):
+        return "Song downloads are temporarily unavailable. Please try again later."
     if "timed out" in low or "writeTimeout" in str(type(e).__name__):
         return (
             "Upload to Telegram timed out (slow connection). "
@@ -587,23 +609,323 @@ def embed_cover_mp3(mp3_path: Path, cover_bytes: bytes) -> bool:
         return False
 
 
+def _is_typetube_public_limit(error: BaseException) -> bool:
+    status_code = getattr(error, "status_code", None)
+    message = str(error).lower()
+    if "region" in message:
+        return False
+    return status_code in (401, 403, 429) or any(
+        marker in message
+        for marker in (
+            "quota",
+            "daily limit",
+            "rate limit",
+            "limit exceeded",
+            "public api key",
+            "no public api key",
+            "error 401",
+            "error 403",
+            "error 429",
+        )
+    )
+
+
+def _close_typetube_client(client) -> None:
+    close = getattr(client, "close", None)
+    if close:
+        try:
+            close()
+        except Exception as error:
+            logger.debug("TypeTube client close failed: %s", type(error).__name__)
+
+
+def _create_typetube_client(create_client, *, host: str, api_key: str | None = None):
+    kwargs = {"host": host, "port": 8443, "timeout_ms": 15000}
+    if api_key:
+        kwargs["api_key"] = api_key
+    try:
+        return create_client(**kwargs)
+    except TypeError as error:
+        if "unexpected keyword argument" in str(error):
+            raise TypeTubeSDKVersionError(
+                "This bot requires the TypeTube 1.1.3 TAP client. Run "
+                "`python -m pip install -r requirements.txt` with the same "
+                "Python environment used to start the bot, then restart it."
+            ) from error
+        raise
+
+
+class _InvalidRangeResponse(Exception):
+    """Raised when a media server ignores or misreports an HTTP byte range."""
+
+
+def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
+    match = re.fullmatch(r"bytes\s+(\d+)-(\d+)/(\d+)", (value or "").strip(), re.I)
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
+
+
+def _download_audio_url(url: str, destination: Path) -> int:
+    """Download all bytes, falling back to one stream if range support is bad."""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Encoding": "identity",
+    }
+
+    def open_request(range_header: str | None = None):
+        request_headers = dict(headers)
+        if range_header:
+            request_headers["Range"] = range_header
+        request = urllib.request.Request(url, headers=request_headers)
+        return urllib.request.urlopen(request, timeout=60)
+
+    def download_linear(expected_size: int | None = None) -> int:
+        downloaded = 0
+        with open_request() as response, destination.open("wb") as output:
+            if response.getcode() != 200:
+                raise _InvalidRangeResponse(
+                    f"Expected a full response, received HTTP {response.getcode()}"
+                )
+            response_size = response.headers.get("Content-Length")
+            if expected_size is None and response_size and response_size.isdigit():
+                expected_size = int(response_size)
+            while True:
+                chunk = response.read(256 * 1024)
+                if not chunk:
+                    break
+                output.write(chunk)
+                downloaded += len(chunk)
+        if downloaded <= 0 or (expected_size and downloaded != expected_size):
+            destination.unlink(missing_ok=True)
+            raise IOError(
+                f"Incomplete audio response ({downloaded} bytes; expected {expected_size})."
+            )
+        return downloaded
+
+    total_size = None
+    try:
+        with open_request("bytes=0-0") as response:
+            if response.getcode() == 206:
+                content_range = _parse_content_range(
+                    response.headers.get("Content-Range")
+                )
+                if content_range and content_range[0] == 0 and content_range[1] == 0:
+                    total_size = content_range[2]
+                    if len(response.read(1)) != 1 or total_size <= 0:
+                        total_size = None
+            # HTTP 200 means ranges are ignored; close this response and stream once.
+    except urllib.error.HTTPError:
+        raise
+    except (OSError, ValueError):
+        total_size = None
+
+    if not total_size or total_size <= 0:
+        return download_linear()
+
+    chunk_size = 4 * 1024 * 1024
+    chunks = [
+        (start, min(start + chunk_size - 1, total_size - 1))
+        for start in range(0, total_size, chunk_size)
+    ]
+    write_lock = threading.Lock()
+
+    try:
+        with destination.open("w+b") as output:
+            output.truncate(total_size)
+
+            def fetch_range(bounds: tuple[int, int]) -> int:
+                start, end = bounds
+                with open_request(f"bytes={start}-{end}") as response:
+                    if response.getcode() != 206:
+                        raise _InvalidRangeResponse(
+                            f"Expected HTTP 206 for bytes {start}-{end}, "
+                            f"received HTTP {response.getcode()}"
+                        )
+                    if _parse_content_range(
+                        response.headers.get("Content-Range")
+                    ) != (start, end, total_size):
+                        raise _InvalidRangeResponse(
+                            f"Server returned an invalid range for bytes {start}-{end}."
+                        )
+                    data = response.read()
+                expected_length = end - start + 1
+                if len(data) != expected_length:
+                    raise _InvalidRangeResponse(
+                        f"Received {len(data)} bytes for bytes {start}-{end}."
+                    )
+                with write_lock:
+                    output.seek(start)
+                    output.write(data)
+                return len(data)
+
+            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+                written = sum(pool.map(fetch_range, chunks))
+            output.flush()
+
+        actual_size = destination.stat().st_size
+        if written != total_size or actual_size != total_size:
+            raise _InvalidRangeResponse(
+                f"Downloaded {written} bytes into a {actual_size}-byte file; "
+                f"expected {total_size}."
+            )
+        return actual_size
+    except _InvalidRangeResponse:
+        destination.unlink(missing_ok=True)
+        logger.warning("TypeTube CDN returned invalid byte ranges; retrying as a stream.")
+        return download_linear(expected_size=total_size)
+
+
+def _probe_media_duration(path: Path) -> float | None:
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", str(path),
+            ],
+            capture_output=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode:
+        return None
+    try:
+        return float(result.stdout.decode("ascii", errors="replace").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _resolve_typetube_track(target: str, cluster_host: str):
+    from typetube import TypeTubeError, create_client
+
+    public_client = _create_typetube_client(create_client, host=cluster_host)
+    try:
+        return public_client, public_client.resolve(target)
+    except TypeTubeError as error:
+        if not _is_typetube_public_limit(error):
+            _close_typetube_client(public_client)
+            raise
+    except Exception:
+        _close_typetube_client(public_client)
+        raise
+
+    try:
+        private_key = owner.get_typetube_api_key()
+    except OSError as error:
+        logger.exception("Could not read the owner-managed TypeTube key.")
+        _close_typetube_client(public_client)
+        raise TypeTubeOwnerKeyUnavailable from error
+    if not private_key:
+        _close_typetube_client(public_client)
+        raise TypeTubeFreeQuotaExhausted
+
+    _close_typetube_client(public_client)
+    logger.info("TypeTube public access is unavailable; trying owner key.")
+    private_client = _create_typetube_client(
+        create_client, api_key=private_key, host=cluster_host
+    )
+    try:
+        return private_client, private_client.resolve(target)
+    except TypeTubeError as error:
+        if _is_typetube_public_limit(error):
+            logger.error("TypeTube owner-key resolve failed: %s", error)
+            _close_typetube_client(private_client)
+            raise TypeTubeOwnerKeyUnavailable from error
+        _close_typetube_client(private_client)
+        raise
+    except Exception:
+        _close_typetube_client(private_client)
+        raise
+
+
+def _download_typetube_source(
+    client, track, target: str, source_path: Path, cluster_host: str
+):
+    """Download through an allowed regional cluster; rotate regions on 403."""
+    cluster_hosts = [host for _, host in owner.TYPE_TUBE_CLUSTERS]
+    try:
+        current_index = cluster_hosts.index(cluster_host)
+    except ValueError:
+        current_index = 0
+
+    while True:
+        try:
+            started = time.perf_counter()
+            bytes_written = _download_audio_url(track.best_audio.url, source_path)
+            elapsed = time.perf_counter() - started
+            average_speed = bytes_written / (1024 * 1024) / max(elapsed, 0.01)
+            return (
+                client,
+                track,
+                bytes_written,
+                average_speed,
+            )
+        except Exception as error:
+            status_code = getattr(
+                error, "status_code", getattr(error, "code", None)
+            )
+            if status_code != 403:
+                _close_typetube_client(client)
+                raise
+            _close_typetube_client(client)
+            source_path.unlink(missing_ok=True)
+            next_region_index = current_index + 1
+            while next_region_index < len(cluster_hosts):
+                next_label, next_host = owner.TYPE_TUBE_CLUSTERS[next_region_index]
+                logger.warning(
+                    "TypeTube returned a regional 403; retrying through %s.",
+                    next_label,
+                )
+                try:
+                    refreshed_client, refreshed_track = _resolve_typetube_track(
+                        target, next_host
+                    )
+                except TypeTubeOwnerKeyUnavailable:
+                    raise
+                except TypeTubeSDKVersionError:
+                    raise
+                except Exception as resolve_error:
+                    logger.warning(
+                        "TypeTube resolve failed in %s (%s); trying the next region.",
+                        next_label, type(resolve_error).__name__,
+                    )
+                    next_region_index += 1
+                    continue
+                if (
+                    not getattr(refreshed_track, "success", False)
+                    or not getattr(refreshed_track, "best_audio", None)
+                    or not refreshed_track.best_audio.url
+                ):
+                    _close_typetube_client(refreshed_client)
+                    raise RuntimeError(
+                        f"TypeTube could not provide an audio stream from {next_label}."
+                    ) from error
+                client, track = refreshed_client, refreshed_track
+                cluster_host = next_host
+                current_index = next_region_index
+                break
+            else:
+                raise
+    raise RuntimeError("TypeTube audio download failed after refreshing the stream.")
+
+
 def download_song_to_ram(
     query: str, metadata_callback=None, picked_override: dict | None = None
 ) -> dict:
-    """Download and extract MP3 audio with yt-dlp into a temporary directory."""
+    """Resolve and download YouTube audio through TypeTube, then encode MP3."""
     query = str(query or "").strip()
     picked = picked_override
     if URL_RE.match(query):
         if not recognition.validate_media_url(query):
-            raise ValueError("Use a supported public YouTube video or Music link.")
+            raise ValueError("Use a supported public YouTube link.")
         target = query
-        video_id = youtube.get_video_id(target)
     else:
         resolve_started = time.perf_counter()
         if not picked:
             picked = resolve_official(query)
         logger.info(
-            "SOURCE_RESOLVE provider=YouTubeSearch took %.2fs",
+            "SOURCE_SEARCH provider=YouTubeSearch took %.2fs",
             time.perf_counter() - resolve_started,
         )
         if not picked or not picked.get("id"):
@@ -611,150 +933,163 @@ def download_song_to_ram(
                 "No confident matching track was found. Try including the artist or version."
             )
         video_id = youtube.get_video_id(str(picked["id"]))
-        candidate_url = str(picked.get("webpage_url") or picked.get("url") or "")
-        target = (
-            candidate_url
-            if recognition.validate_media_url(candidate_url)
-            and youtube.get_video_id(candidate_url) == video_id
-            else f"https://www.youtube.com/watch?v={video_id}"
+        target = f"https://www.youtube.com/watch?v={video_id}"
+
+    resolve_started = time.perf_counter()
+    client = track = cluster_host = None
+    last_region_error = None
+    for region_label, candidate_host in owner.TYPE_TUBE_CLUSTERS:
+        try:
+            client, track = _resolve_typetube_track(target, candidate_host)
+            cluster_host = candidate_host
+            break
+        except TypeTubeOwnerKeyUnavailable:
+            raise
+        except TypeTubeSDKVersionError:
+            raise
+        except TypeTubeFreeQuotaExhausted as error:
+            last_region_error = error
+            logger.warning(
+                "TypeTube public access is unavailable in %s; trying the next region.",
+                region_label,
+            )
+        except Exception as error:
+            last_region_error = error
+            logger.warning(
+                "TypeTube resolve failed in %s (%s); trying the next region.",
+                region_label, type(error).__name__,
+            )
+    if client is None or track is None or cluster_host is None:
+        raise RuntimeError(
+            "TypeTube could not resolve this track from its available regions."
+        ) from last_region_error
+    resolve_seconds = time.perf_counter() - resolve_started
+    if (
+        not getattr(track, "success", False)
+        or not getattr(track, "id", None)
+        or not getattr(track, "best_audio", None)
+        or not getattr(track.best_audio, "url", None)
+    ):
+        _close_typetube_client(client)
+        raise RuntimeError("TypeTube did not return a playable audio stream.")
+
+    try:
+        video_id = youtube.get_video_id(str(track.id))
+    except youtube.YouTubeError as error:
+        _close_typetube_client(client)
+        raise RuntimeError("TypeTube did not return a valid YouTube video ID.") from error
+    try:
+        duration = int(track.duration_seconds or 0)
+    except (TypeError, ValueError, OverflowError):
+        duration = 0
+    if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
+        _close_typetube_client(client)
+        raise ValueError(
+            f"Too long ({duration // 60}:{duration % 60:02d}). "
+            f"Max allowed is {MAX_DURATION_SEC // 60} min."
         )
 
-    callback_sent = False
-
-    def report_metadata(info: dict) -> None:
-        nonlocal callback_sent
-        if callback_sent or not metadata_callback:
-            return
-        title = str(info.get("track") or info.get("title") or query)
-        artist = str(
-            info.get("artist")
-            or info.get("creator")
-            or info.get("author")
-            or info.get("uploader")
-            or info.get("channel")
-            or ""
-        )
-        display_title, display_artist = curate_track(title, artist)
+    track_title = track.title or (picked or {}).get("title") or query
+    track_artist = track.author or (picked or {}).get("artist") or ""
+    display_title, display_artist = curate_track(str(track_title), str(track_artist))
+    if metadata_callback:
         label = (
-            f"{display_title} · {display_artist}"
+            f"{display_title} \u00b7 {display_artist}"
             if display_artist else display_title
         )
         try:
             metadata_callback(label)
-            callback_sent = True
         except Exception as error:
             logger.warning("Could not report resolved track metadata: %s", error)
 
-    def progress_hook(event: dict) -> None:
-        info = event.get("info_dict")
-        if isinstance(info, dict):
-            report_metadata(info)
-
-    def duration_filter(info: dict, *, incomplete: bool) -> str | None:
-        del incomplete
-        try:
-            duration = int(info.get("duration") or 0)
-        except (TypeError, ValueError, OverflowError):
-            duration = 0
-        if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
-            maximum = MAX_DURATION_SEC
-            return (
-                f"Too long ({int(duration) // 60}:{int(duration) % 60:02d}). "
-                f"Max allowed is {maximum // 60} min."
-            )
-        return None
+    logger.info(
+        "SOURCE_RESOLVE provider=TypeTube region=%s took %.2fs latency=%.0fms id=%s",
+        next(label for label, host in owner.TYPE_TUBE_CLUSTERS if host == cluster_host),
+        resolve_seconds,
+        getattr(track, "latency_ms", 0) or 0,
+        video_id,
+    )
+    mime_type = str(track.best_audio.mime_type or "").lower()
+    source_suffix = (
+        ".m4a" if "mp4" in mime_type or "m4a" in mime_type else
+        ".webm" if "webm" in mime_type else
+        ".ogg" if "ogg" in mime_type else
+        ".mp3" if "mpeg" in mime_type else ".audio"
+    )
 
     with tempfile.TemporaryDirectory(prefix="songbot_") as tmpdir:
-        options = {
-            "format": "bestaudio/best",
-            "outtmpl": str(Path(tmpdir) / "%(id)s.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "cachedir": False,
-            "socket_timeout": 20,
-            "retries": 3,
-            "fragment_retries": 3,
-            "concurrent_fragment_downloads": YTDLP_CONCURRENT_FRAGMENTS,
-            "match_filter": duration_filter,
-            "progress_hooks": [progress_hook],
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": str(MP3_QUALITY),
-            }],
-        }
-        if MAX_FILE_MB:
-            options["max_filesize"] = MAX_FILE_MB * 1024 * 1024
-
+        source_path = Path(tmpdir) / f"source-{video_id}{source_suffix}"
+        mp3_path = Path(tmpdir) / f"{video_id}.mp3"
         download_started = time.perf_counter()
-        try:
-            with yt_dlp.YoutubeDL(options) as downloader:
-                info = downloader.extract_info(target, download=True)
-        except yt_dlp.utils.DownloadError as error:
-            if "HTTP Error 403" in str(error):
-                raise RuntimeError(
-                    "YouTube refused the audio stream (HTTP 403). Update the bot "
-                    "environment with `pip install --upgrade \"yt-dlp[default]\"`, "
-                    "use Python 3.11 or newer, and install a JavaScript runtime "
-                    "such as Deno. Some videos may still be blocked from the "
-                    "server's network."
-                ) from error
-            raise RuntimeError(str(error).strip()[:400]) from error
+        client, track, bytes_written, average_speed = _download_typetube_source(
+            client, track, target, source_path, cluster_host
+        )
+        _close_typetube_client(client)
+        del client
         download_seconds = time.perf_counter() - download_started
-        if not isinstance(info, dict):
-            raise RuntimeError("yt-dlp did not return track metadata.")
+        if not source_path.is_file() or source_path.stat().st_size < 1024:
+            raise RuntimeError("TypeTube audio download did not produce a file.")
+        source_size = source_path.stat().st_size
+        source_mb = source_size / (1024 * 1024)
+        if MAX_FILE_MB and source_size > MAX_FILE_MB * 1024 * 1024:
+            raise ValueError(
+                f"Source audio is too large ({source_mb:.1f} MB > {MAX_FILE_MB} MB)."
+            )
+        if average_speed is None:
+            average_speed = bytes_written / (1024 * 1024) / max(download_seconds, 0.01)
+        logger.info(
+            "SOURCE_DOWNLOAD provider=TypeTube took %.2fs size=%.2fMB rate=%.2fMB/s",
+            download_seconds,
+            source_mb,
+            average_speed,
+        )
 
-        video_id = youtube.get_video_id(str(info.get("id") or video_id))
-        output_path = Path(tmpdir) / f"{video_id}.mp3"
-        if not output_path.is_file() or output_path.stat().st_size < 1024:
-            raise RuntimeError("yt-dlp did not produce an MP3 audio file.")
-        output_size = output_path.stat().st_size
+        transcode_started = time.perf_counter()
+        process = subprocess.run(
+            [
+                "ffmpeg", "-nostdin", "-y", "-v", "error", "-i", str(source_path),
+                "-vn", "-codec:a", "libmp3lame", "-b:a", f"{MP3_QUALITY}k",
+                "-threads", "0", str(mp3_path),
+            ],
+            capture_output=True,
+            timeout=120,
+        )
+        if (
+            process.returncode
+            or not mp3_path.is_file()
+            or mp3_path.stat().st_size < 1024
+        ):
+            detail = process.stderr.decode("utf-8", errors="replace").strip()
+            raise RuntimeError(f"Could not convert TypeTube audio to MP3: {detail[:200]}")
+        actual_duration = _probe_media_duration(mp3_path)
+        if actual_duration is not None and duration > 0:
+            tolerance = max(2.0, duration * 0.05)
+            if actual_duration + tolerance < duration:
+                raise RuntimeError(
+                    "TypeTube returned an incomplete audio stream "
+                    f"({actual_duration:.1f}s of {duration}s). Please retry the song."
+                )
+            logger.info(
+                "SOURCE_VERIFY expected_duration=%.1fs actual_duration=%.1fs",
+                duration,
+                actual_duration,
+            )
+        logger.info(
+            "SOURCE_TRANSCODE provider=TypeTube bitrate=%sk took %.2fs",
+            MP3_QUALITY,
+            time.perf_counter() - transcode_started,
+        )
+
+        output_size = mp3_path.stat().st_size
         size_mb = output_size / (1024 * 1024)
         if MAX_FILE_MB and output_size > MAX_FILE_MB * 1024 * 1024:
             raise ValueError(
-                f"File too large ({size_mb:.1f} MB > {MAX_FILE_MB} MB). "
-                "Try a shorter song."
+                f"File too large ({size_mb:.1f} MB > {MAX_FILE_MB} MB). Try a shorter song."
             )
-
-        duration = int(info.get("duration") or 0)
-        if MAX_DURATION_SEC and duration > MAX_DURATION_SEC:
-            raise ValueError(
-                f"Too long ({duration // 60}:{duration % 60:02d}). "
-                f"Max allowed is {MAX_DURATION_SEC // 60} min."
-            )
-        track_title = (
-            info.get("track")
-            or info.get("title")
-            or (picked or {}).get("title")
-            or query
-        )
-        track_artist = (
-            info.get("artist")
-            or info.get("creator")
-            or info.get("author")
-            or info.get("uploader")
-            or info.get("channel")
-            or (picked or {}).get("artist")
-            or ""
-        )
-        display_title, display_artist = curate_track(
-            str(track_title), str(track_artist)
-        )
-        report_metadata({
-            "title": display_title,
-            "artist": display_artist or "",
-        })
-        logger.info(
-            "SOURCE_DOWNLOAD provider=yt-dlp took %.2fs size=%.2fMB bitrate=%sk",
-            download_seconds,
-            size_mb,
-            MP3_QUALITY,
-        )
         cover_bytes = fetch_cover_jpeg(video_id)
         if cover_bytes:
-            embed_cover_mp3(output_path, cover_bytes)
-        audio_bytes = output_path.read_bytes()
+            embed_cover_mp3(mp3_path, cover_bytes)
+        audio_bytes = mp3_path.read_bytes()
 
     return {
         "audio_bytes": audio_bytes,
@@ -764,8 +1099,8 @@ def download_song_to_ram(
         "title": display_title,
         "uploader": display_artist,
         "duration": duration,
-        "album": info.get("album"),
-        "thumbnail": info.get("thumbnail"),
+        "album": None,
+        "thumbnail": getattr(track, "thumbnail", None),
         "webpage_url": target,
         "id": video_id,
     }
@@ -1998,6 +2333,82 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             raise
         return
 
+    cache_video_id = None
+    try:
+        if recognition_candidate and recognition_candidate.get("id"):
+            cache_video_id = youtube.get_video_id(
+                str(recognition_candidate["id"])
+            )
+        elif URL_RE.match(query.strip()):
+            cache_video_id = youtube.get_video_id(query)
+    except youtube.YouTubeError:
+        cache_video_id = None
+
+    cache_variant = (
+        f"{TELEGRAM_AUDIO_CACHE_VERSION}:{MP3_QUALITY}:{default_fx}"
+    )
+    cached_audio = None
+    if cache_video_id:
+        try:
+            cached_audio = await asyncio.to_thread(
+                OWNER_CONSOLE.get_cached_audio, cache_video_id, cache_variant
+            )
+        except Exception as error:
+            logger.warning("Telegram audio cache read failed: %s", type(error).__name__)
+    if cached_audio:
+        try:
+            sent = await update.message.reply_audio(
+                audio=cached_audio["file_id"],
+                title=_no_dashes(cached_audio["title"])[:64],
+                performer=_no_dashes(cached_audio.get("performer") or "")[:64] or None,
+                duration=cached_audio.get("duration") or None,
+            )
+        except BadRequest as error:
+            message = str(error).lower()
+            if "file identifier" not in message and "file_id" not in message:
+                raise
+            logger.warning(
+                "Cached Telegram audio ID was rejected; rebuilding video_id=%s",
+                cache_video_id,
+            )
+            try:
+                await asyncio.to_thread(
+                    OWNER_CONSOLE.delete_cached_audio, cache_video_id, cache_variant
+                )
+            except Exception as cache_error:
+                logger.warning(
+                    "Could not remove rejected Telegram audio ID: %s",
+                    type(cache_error).__name__,
+                )
+        else:
+            chat_id = update.effective_chat.id
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id,
+                    sent.message_id,
+                    reply_markup=song_menu(chat_id, sent.message_id, no_controls),
+                )
+            except TelegramError as error:
+                logger.warning("Could not attach cached song controls: %s", error)
+            remember_session(chat_id, sent.message_id, {
+                "query": query,
+                "video_id": cache_video_id,
+                "title": cached_audio["title"],
+                "uploader": cached_audio.get("performer"),
+                "base_title": cached_audio["base_title"],
+                "applied_effect": default_fx,
+                "duration": cached_audio.get("duration") or 0,
+                "album": None,
+                "file_id": sent.audio.file_id if sent.audio else cached_audio["file_id"],
+                "cover_bytes": None,
+                "original_audio_filename": f"{cache_video_id}.mp3",
+                "playlist_only": no_controls,
+            })
+            logger.info(
+                "AUDIO_CACHE_HIT video_id=%s variant=%s", cache_video_id, cache_variant
+            )
+            return
+
     status = await update.message.reply_text(
         searching_status_html(query),
         parse_mode="HTML",
@@ -2183,6 +2594,23 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "original_audio_filename": original_audio_filename,
             "playlist_only": no_controls,
         })
+        if sent and sent.audio and sent.audio.file_id:
+            stored_variant = (
+                f"{TELEGRAM_AUDIO_CACHE_VERSION}:{MP3_QUALITY}:{applied_effect}"
+            )
+            try:
+                await asyncio.to_thread(
+                    OWNER_CONSOLE.cache_audio,
+                    meta["id"],
+                    stored_variant,
+                    file_id=sent.audio.file_id,
+                    title=meta["title"],
+                    base_title=base_title,
+                    performer=performer,
+                    duration=duration or None,
+                )
+            except Exception as error:
+                logger.warning("Telegram audio cache write failed: %s", type(error).__name__)
         await status.delete()
 
     except Exception as e:
@@ -3763,6 +4191,7 @@ def main() -> None:
     app.add_handler(CommandHandler("owner", OWNER_CONSOLE.owner_command))
     app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(CommandHandler("stats", OWNER_CONSOLE.stats_command))
+    app.add_handler(CommandHandler("apikey", OWNER_CONSOLE.apikey_command))
     app.add_handler(CommandHandler("broadcast", OWNER_CONSOLE.begin_broadcast))
     app.add_handler(
         CommandHandler("broadcast_button", OWNER_CONSOLE.broadcast_button_command)
