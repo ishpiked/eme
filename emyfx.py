@@ -9,7 +9,6 @@ Every preset is a single `-filter_complex` graph rendered in one ffmpeg pass
   slowed  slowed + reverb (0.85x, natural pitch drop, -14 LUFS / -1 dBTP)
   vinyl   warm record player: crackle, hiss, wow/flutter, gentle saturation
   lofi    dusty mellow: 22.05 kHz band-limit, ~13-bit quantisation, tape hiss
-  phonk   source-rhythm bass shaping, controlled saturation and punch
   dreamy  filtered soft reflections and a spacious stereo image
 
 Design rules encoded here (from the preset spec):
@@ -151,22 +150,6 @@ def _graph_3d(duration: float | None) -> str:
     )
 
 
-def _graph_phonk(duration: float | None) -> str:
-    """Phonk: deterministic low-end weight and saturated, punchy upper band."""
-    del duration
-    return (
-        f"[0:a]{_STEREO},asplit=3[body][basssrc][drumssrc];"
-        "[body]volume=0.72[main];"
-        "[basssrc]lowpass=f=150,bass=g=5:f=75,"
-        "asoftclip=type=tanh:param=1.4:oversample=2,volume=0.58[bass];"
-        "[drumssrc]highpass=f=150,"
-        "acompressor=threshold=0.18:ratio=2.8:attack=7:release=90,"
-        "asoftclip=type=tanh:param=1.8:oversample=2,volume=0.24[drums];"
-        "[main][bass][drums]amix=inputs=3:normalize=0:duration=first,"
-        f"{_SAFE_TAIL}[out]"
-    )
-
-
 def _graph_dreamy(duration: float | None) -> str:
     """Dreamy: restrained, filtered reflections over a clear direct signal."""
     del duration
@@ -301,13 +284,6 @@ PRESETS: dict = {
         "build": _graph_3d,
         "notes": "gentle depth, short early reflections, soft width and centred bass",
         "headphones": True,
-    },
-    "phonk": {
-        "key": "phonk",
-        "label": "Phonk",
-        "suffix": "(Phonk)",
-        "build": _graph_phonk,
-        "notes": "shaped bass, controlled saturation and punch from the source rhythm",
     },
     "dreamy": {
         "key": "dreamy",

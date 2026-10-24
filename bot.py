@@ -87,6 +87,7 @@ BOT_ABOUT = os.getenv(
 )
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "600"))  # 10 min default
 MAX_FILE_MB = int(os.getenv("MAX_FILE_MB", "49"))  # Telegram bots cap ~50MB
+TELEGRAM_URL_FETCH_MAX_BYTES = 20_000_000
 MP3_QUALITY = os.getenv("MP3_QUALITY", "320")  # used only when stream conversion is required
 TELEGRAM_AUDIO_CACHE_VERSION = "v3"
 TELEGRAM_LOCAL_API_URL = os.getenv("TELEGRAM_LOCAL_API_URL", "").strip()
@@ -101,12 +102,14 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+# HTTPX logs full Bot API request URLs at INFO, including the bot token.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 MAX_INLINE_QUERY_LENGTH = 256
-INLINE_QUERY_TIMEOUT = 3.0
+INLINE_QUERY_TIMEOUT = 1.0
 
 
 def derive_artist(entry: dict) -> str:
@@ -216,13 +219,13 @@ SEARCH_RESULT_CACHE: dict[str, tuple[float, int, list[dict]]] = {}
 SEARCH_SELECTIONS: dict[str, dict] = {}
 SEARCH_RESULT_TTL = 300
 SEARCH_SELECTION_TTL = 600
-TYPE_TUBE_PREFETCH_LIMIT = max(0, int(os.getenv("TYPETUBE_PREFETCH_LIMIT", "10")))
-TYPE_TUBE_PREFETCH_TTL = 30
+TYPE_TUBE_PREFETCH_LIMIT = max(0, int(os.getenv("TYPETUBE_PREFETCH_LIMIT", "20")))
+TYPE_TUBE_PREFETCH_TTL = 60
 TYPE_TUBE_PREFETCH_CACHE: dict[str, tuple[float, object, str]] = {}
 TYPE_TUBE_PREFETCH_INFLIGHT = {}
 TYPE_TUBE_PREFETCH_LOCK = threading.RLock()
 TYPE_TUBE_PREFETCH_EXECUTOR = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="typetube-prefetch"
+    max_workers=8, thread_name_prefix="typetube-prefetch"
 )
 
 
@@ -240,7 +243,7 @@ async def resolve_candidates_async(
     """
     cache_key = _normalize_search_query(query)
     now = time.time()
-    fetch = min(25, max(limit, 10))
+    fetch = max(limit, 1)  # Reduced: only fetch as many as needed
     cached = SEARCH_RESULT_CACHE.get(cache_key)
     if cached and cached[0] > now and cached[1] >= fetch:
         logger.info(
@@ -539,6 +542,20 @@ class TypeTubeSDKVersionError(RuntimeError):
     """Raised when an old TypeTube package cannot speak to TAP clusters."""
 
 
+class TypeTubeSourceBlocked(RuntimeError):
+    """Raised when every resolvable TypeTube stream URL rejects local access."""
+
+    def __init__(self, audio_stream):
+        super().__init__(
+            "YouTube refused direct downloads from this server's network region."
+        )
+        self.audio_stream = audio_stream
+
+
+class SongSourceUnavailable(RuntimeError):
+    """Raised when no supported route can retrieve the selected audio source."""
+
+
 def friendly_error(e: BaseException) -> str:
     msg = ANSI_RE.sub("", str(e)).strip()
     low = msg.lower()
@@ -546,6 +563,10 @@ def friendly_error(e: BaseException) -> str:
         return msg
     if isinstance(e, (TypeTubeFreeQuotaExhausted, TypeTubeOwnerKeyUnavailable)):
         return "Song downloads are temporarily unavailable. Please try again later."
+    if isinstance(e, TypeTubeSourceBlocked):
+        return "The audio source is blocking this server's network. Please try again later."
+    if isinstance(e, SongSourceUnavailable):
+        return str(e)
     if isinstance(e, youtube.YouTubeError):
         return msg[:400]
     if isinstance(e, urllib.error.HTTPError) and e.code == 403:
@@ -651,7 +672,11 @@ def _close_typetube_client(client) -> None:
 
 
 def _create_typetube_client(create_client, *, host: str, api_key: str | None = None):
-    kwargs = {"host": host, "port": 8443, "timeout_ms": 15000}
+    kwargs = {
+        "host": owner.typetube_sdk_host(host),
+        "port": 8443,
+        "timeout_ms": 3000,
+    }
     if api_key:
         kwargs["api_key"] = api_key
     try:
@@ -768,6 +793,15 @@ def _parse_content_range(value: str | None) -> tuple[int, int, int] | None:
     return tuple(int(part) for part in match.groups())
 
 
+def _audio_url_size_bytes(url: str) -> int | None:
+    try:
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)
+        value = query.get("clen", [None])[0]
+        return int(value) if value and value.isdigit() else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _download_audio_url(url: str, destination: Path) -> int:
     """Download all bytes, falling back to one stream if range support is bad."""
     headers = {
@@ -775,28 +809,40 @@ def _download_audio_url(url: str, destination: Path) -> int:
         "Accept-Encoding": "identity",
     }
 
-    def open_request(range_header: str | None = None):
+    def open_request(range_header: str | None = None, timeout: int = 60):
         request_headers = dict(headers)
         if range_header:
             request_headers["Range"] = range_header
-        return _open_typetube_audio_request(url, request_headers, timeout=60)
+        return _open_typetube_audio_request(url, request_headers, timeout=timeout)
 
-    def download_linear(expected_size: int | None = None) -> int:
-        downloaded = 0
-        with open_request() as response, destination.open("wb") as output:
-            if response.getcode() != 200:
-                raise _InvalidRangeResponse(
-                    f"Expected a full response, received HTTP {response.getcode()}"
-                )
-            response_size = response.headers.get("Content-Length")
-            if expected_size is None and response_size and response_size.isdigit():
-                expected_size = int(response_size)
-            while True:
-                chunk = response.read(256 * 1024)
-                if not chunk:
-                    break
-                output.write(chunk)
-                downloaded += len(chunk)
+    def download_linear(expected_size: int | None = None, timeout: int = 60) -> int:
+        for attempt in range(2):
+            downloaded = 0
+            try:
+                with open_request(timeout=timeout) as response, destination.open("wb") as output:
+                    if response.getcode() != 200:
+                        raise _InvalidRangeResponse(
+                            f"Expected a full response, received HTTP {response.getcode()}"
+                        )
+                    response_size = response.headers.get("Content-Length")
+                    if expected_size is None and response_size and response_size.isdigit():
+                        expected_size = int(response_size)
+                    while True:
+                        chunk = response.read(256 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                break
+            except urllib.error.HTTPError:
+                destination.unlink(missing_ok=True)
+                raise
+            except (TimeoutError, ConnectionError, http.client.IncompleteRead):
+                destination.unlink(missing_ok=True)
+                if attempt:
+                    raise
+                logger.warning("TypeTube sequential audio stream stalled; retrying once.")
+                time.sleep(0.25)
         if downloaded <= 0 or (expected_size and downloaded != expected_size):
             destination.unlink(missing_ok=True)
             raise IOError(
@@ -804,27 +850,45 @@ def _download_audio_url(url: str, destination: Path) -> int:
             )
         return downloaded
 
-    total_size = None
-    try:
-        with open_request("bytes=0-0") as response:
-            if response.getcode() == 206:
-                content_range = _parse_content_range(
-                    response.headers.get("Content-Range")
-                )
-                if content_range and content_range[0] == 0 and content_range[1] == 0:
-                    total_size = content_range[2]
-                    if len(response.read(1)) != 1 or total_size <= 0:
-                        total_size = None
-            # HTTP 200 means ranges are ignored; close this response and stream once.
-    except urllib.error.HTTPError:
-        raise
-    except (OSError, ValueError):
-        total_size = None
+    chunk_size = 4 * 1024 * 1024
+    declared_size = _audio_url_size_bytes(url)
+    if declared_size and declared_size <= chunk_size:
+        # A one-chunk range download adds a probe and a second connection without
+        # any parallelism. Fetch small streams directly instead.
+        logger.debug(
+            "TypeTube audio stream is small (%d bytes); skipping range requests.",
+            declared_size,
+        )
+        return download_linear(timeout=20)
+
+    total_size = declared_size if declared_size and declared_size > chunk_size else None
+    if total_size is None:
+        try:
+            with open_request("bytes=0-0") as response:
+                if response.getcode() == 206:
+                    content_range = _parse_content_range(
+                        response.headers.get("Content-Range")
+                    )
+                    if content_range and content_range[0] == 0 and content_range[1] == 0:
+                        total_size = content_range[2]
+                        if len(response.read(1)) != 1 or total_size <= 0:
+                            total_size = None
+                # HTTP 200 means ranges are ignored; close this response and stream once.
+        except urllib.error.HTTPError:
+            raise
+        except (OSError, ValueError):
+            total_size = None
 
     if not total_size or total_size <= 0:
         return download_linear()
+    if total_size <= chunk_size:
+        # The probe found a one-chunk stream with no possible range parallelism.
+        logger.debug(
+            "TypeTube audio stream is small (%d bytes); downloading it linearly.",
+            total_size,
+        )
+        return download_linear(expected_size=total_size, timeout=20)
 
-    chunk_size = 4 * 1024 * 1024
     chunks = [
         (start, min(start + chunk_size - 1, total_size - 1))
         for start in range(0, total_size, chunk_size)
@@ -837,30 +901,45 @@ def _download_audio_url(url: str, destination: Path) -> int:
 
             def fetch_range(bounds: tuple[int, int]) -> int:
                 start, end = bounds
-                with open_request(f"bytes={start}-{end}") as response:
-                    if response.getcode() != 206:
-                        raise _InvalidRangeResponse(
-                            f"Expected HTTP 206 for bytes {start}-{end}, "
-                            f"received HTTP {response.getcode()}"
+                for attempt in range(2):
+                    try:
+                        with open_request(
+                            f"bytes={start}-{end}", timeout=12
+                        ) as response:
+                            if response.getcode() != 206:
+                                raise _InvalidRangeResponse(
+                                    f"Expected HTTP 206 for bytes {start}-{end}, "
+                                    f"received HTTP {response.getcode()}"
+                                )
+                            if _parse_content_range(
+                                response.headers.get("Content-Range")
+                            ) != (start, end, total_size):
+                                raise _InvalidRangeResponse(
+                                    f"Server returned an invalid range for bytes {start}-{end}."
+                                )
+                            data = response.read()
+                        expected_length = end - start + 1
+                        if len(data) != expected_length:
+                            raise _InvalidRangeResponse(
+                                f"Received {len(data)} bytes for bytes {start}-{end}."
+                            )
+                        with write_lock:
+                            output.seek(start)
+                            output.write(data)
+                        return len(data)
+                    except urllib.error.HTTPError:
+                        raise
+                    except (TimeoutError, ConnectionError, http.client.IncompleteRead):
+                        if attempt:
+                            raise
+                        logger.warning(
+                            "TypeTube audio range %d-%d stalled; retrying once.",
+                            start, end,
                         )
-                    if _parse_content_range(
-                        response.headers.get("Content-Range")
-                    ) != (start, end, total_size):
-                        raise _InvalidRangeResponse(
-                            f"Server returned an invalid range for bytes {start}-{end}."
-                        )
-                    data = response.read()
-                expected_length = end - start + 1
-                if len(data) != expected_length:
-                    raise _InvalidRangeResponse(
-                        f"Received {len(data)} bytes for bytes {start}-{end}."
-                    )
-                with write_lock:
-                    output.seek(start)
-                    output.write(data)
-                return len(data)
+                        time.sleep(0.25)
+                raise RuntimeError(f"Audio range {start}-{end} could not be fetched.")
 
-            with ThreadPoolExecutor(max_workers=min(8, len(chunks))) as pool:
+            with ThreadPoolExecutor(max_workers=min(4, len(chunks))) as pool:
                 written = sum(pool.map(fetch_range, chunks))
             output.flush()
 
@@ -874,6 +953,13 @@ def _download_audio_url(url: str, destination: Path) -> int:
     except _InvalidRangeResponse:
         destination.unlink(missing_ok=True)
         logger.warning("TypeTube CDN returned invalid byte ranges; retrying as a stream.")
+        return download_linear(expected_size=total_size)
+    except (TimeoutError, ConnectionError, http.client.IncompleteRead) as error:
+        destination.unlink(missing_ok=True)
+        logger.warning(
+            "TypeTube range download stalled (%s); retrying as a single stream.",
+            type(error).__name__,
+        )
         return download_linear(expected_size=total_size)
 
 
@@ -915,6 +1001,15 @@ def _telegram_audio_stream(track):
         if "mp4" in mime or "m4a" in mime or "mpeg" in mime or "mp3" in mime:
             compatible.append(stream)
 
+    # TypeTube's own selector avoids GCR-tagged URLs because those are more
+    # likely to be restricted to the resolver's region.
+    non_gcr = [
+        stream for stream in compatible
+        if "gcr=" not in str(getattr(stream, "url", "")).lower()
+    ]
+    if non_gcr:
+        compatible = non_gcr
+
     if best in compatible:
         return best
     if compatible:
@@ -922,7 +1017,59 @@ def _telegram_audio_stream(track):
     return best
 
 
-def _resolve_typetube_track(target: str, cluster_host: str):
+def _audio_stream_size_bytes(audio_stream) -> int | None:
+    try:
+        return _audio_url_size_bytes(str(audio_stream.url))
+    except (AttributeError, TypeError):
+        return None
+
+
+def _telegram_remote_audio_meta(
+    audio_stream, track, *, video_id: str, target: str, title: str,
+    artist: str, duration: int,
+) -> dict | None:
+    """Build metadata for Telegram-side fetches supported by the Bot API."""
+    mime_type = str(getattr(audio_stream, "mime_type", "") or "").lower()
+    if not any(marker in mime_type for marker in ("mp4", "m4a", "mpeg", "mp3")):
+        return None
+    source_size = _audio_stream_size_bytes(audio_stream)
+    if not source_size or source_size > TELEGRAM_URL_FETCH_MAX_BYTES:
+        return None
+    extension = "m4a" if "mp4" in mime_type or "m4a" in mime_type else "mp3"
+    return {
+        "audio_bytes": None,
+        "audio_filename": f"{video_id}.{extension}",
+        "cover_bytes": None,
+        "size_mb": source_size / (1024 * 1024),
+        "title": title,
+        "uploader": artist,
+        "duration": duration,
+        "album": None,
+        "thumbnail": getattr(track, "thumbnail", None),
+        "webpage_url": target,
+        "id": video_id,
+        "remote_audio_url": audio_stream.url,
+        "remote_only": True,
+    }
+
+
+def _download_youtube_audio_fallback(target: str, destination: Path):
+    """Resolve a fresh player URL for this server and download its audio locally."""
+    player = youtube.resolve(target)
+    stream = youtube.select_audio_format(player["formats"])
+    max_bytes = MAX_FILE_MB * 1024 * 1024 if MAX_FILE_MB else None
+    started = time.perf_counter()
+    size = youtube.download_format(stream, destination, max_bytes=max_bytes)
+    elapsed = max(time.perf_counter() - started, 0.01)
+    audio_stream = SimpleNamespace(
+        url=stream["url"],
+        mime_type=stream.get("mimeType") or "",
+        bitrate=stream.get("bitrate"),
+    )
+    return audio_stream, size, size / (1024 * 1024) / elapsed
+
+
+def _resolve_typetube_track_tap(target: str, cluster_host: str):
     from typetube import TypeTubeError, create_client
 
     public_client = _create_typetube_client(create_client, host=cluster_host)
@@ -965,6 +1112,183 @@ def _resolve_typetube_track(target: str, cluster_host: str):
         raise
 
 
+def _track_from_typetube_node(payload: dict):
+    data = payload.get("data") or {}
+    metadata = payload.get("meta") or {}
+
+    def audio_stream(raw):
+        if not isinstance(raw, dict):
+            return None
+        return SimpleNamespace(
+            itag=raw.get("itag", 0),
+            quality=raw.get("quality", ""),
+            mime_type=raw.get("mimeType", ""),
+            bitrate=raw.get("bitrate", 0),
+            url=raw.get("url", ""),
+            is_hifi=raw.get("isHiFi", False),
+            raw_url=raw.get("rawUrl"),
+        )
+
+    audio_streams = [
+        converted
+        for raw in (data.get("audioStreams") or [])
+        if (converted := audio_stream(raw)) is not None
+    ]
+    best_audio = audio_stream(data.get("bestAudio"))
+    return SimpleNamespace(
+        success=bool(payload.get("success")),
+        id=data.get("id", ""),
+        title=data.get("title", ""),
+        author=data.get("author", ""),
+        uploader=data.get("uploader") or data.get("author", ""),
+        duration_seconds=data.get("durationSeconds", 0),
+        thumbnail=data.get("thumbnail"),
+        thumbnails=data.get("thumbnails") or [],
+        latency_ms=metadata.get("latencyMs", 0.0),
+        meta=metadata,
+        best_audio=best_audio,
+        audio_streams=audio_streams,
+        best_video=data.get("bestVideo"),
+        video_streams=data.get("videoStreams") or [],
+    )
+
+
+def _resolve_typetube_track(target: str, cluster_host: str):
+    """Resolve a video through one regional HTTPS node."""
+    try:
+        video_id = youtube.get_video_id(target)
+        params = {"id": video_id}
+    except youtube.YouTubeError:
+        params = {"q": str(target).strip()}
+
+    node = urllib.parse.urlsplit(str(cluster_host).rstrip("/"))
+    if (
+        node.scheme != "https"
+        or not node.hostname
+        or node.username is not None
+        or node.password is not None
+        or node.path not in ("", "/")
+        or node.query
+        or node.fragment
+    ):
+        raise ValueError("Invalid TypeTube regional resolver URL.")
+    url = urllib.parse.urlunsplit((
+        node.scheme,
+        node.netloc,
+        "/resolve",
+        urllib.parse.urlencode(params),
+        "",
+    ))
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": youtube.USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=5.0) as response:
+        raw_payload = response.read(4_000_001)
+    if len(raw_payload) > 4_000_000:
+        raise RuntimeError("TypeTube regional response exceeded the size limit.")
+    try:
+        payload = json.loads(raw_payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError("TypeTube regional node returned invalid JSON.") from error
+    if not isinstance(payload, dict) or not payload.get("success"):
+        error = payload.get("error") if isinstance(payload, dict) else None
+        detail = error.get("message") if isinstance(error, dict) else "resolve failed"
+        raise RuntimeError(f"TypeTube regional resolve failed: {str(detail)[:160]}")
+    track = _track_from_typetube_node(payload)
+    if not track.id or not _telegram_audio_stream(track):
+        raise RuntimeError("TypeTube regional node returned no playable audio.")
+    return None, track
+
+
+def _typetube_region_label(cluster_host: str) -> str:
+    for label, host in (*owner.TYPE_TUBE_CLUSTERS, *owner.TYPE_TUBE_TAP_CLUSTERS):
+        if host == cluster_host:
+            return label
+    return "unknown"
+
+
+def _resolve_all_regions_parallel_sync(target: str) -> tuple:
+    """Return the first regional resolution and leave slower requests in the background."""
+    import concurrent.futures
+
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=len(owner.TYPE_TUBE_CLUSTERS),
+        thread_name_prefix="typetube-region",
+    )
+    future_to_region = {
+        executor.submit(_resolve_typetube_track, target, host): (label, host)
+        for label, host in owner.TYPE_TUBE_CLUSTERS
+    }
+    public_quota_error = None
+
+    def close_losing_result(future) -> None:
+        if future.cancelled():
+            return
+        try:
+            losing_client, _ = future.result()
+        except Exception:
+            return
+        _close_typetube_client(losing_client)
+
+    try:
+        for future in concurrent.futures.as_completed(future_to_region):
+            label, host = future_to_region[future]
+            try:
+                returned_client, returned_track = future.result()
+                if returned_track is not None:
+                    for other in future_to_region:
+                        if other is future:
+                            continue
+                        if not other.cancel():
+                            other.add_done_callback(close_losing_result)
+                    return returned_track, returned_client, host
+                _close_typetube_client(returned_client)
+            except (TypeTubeOwnerKeyUnavailable, TypeTubeSDKVersionError):
+                for other in future_to_region:
+                    if other is not future and not other.cancel():
+                        other.add_done_callback(close_losing_result)
+                raise
+            except TypeTubeFreeQuotaExhausted as error:
+                public_quota_error = error
+                logger.debug("TypeTube public quota is exhausted in %s.", label)
+            except Exception as error:
+                logger.warning(
+                    "TypeTube region %s (%s) failed (%s): %s",
+                    label,
+                    urllib.parse.urlsplit(host).hostname or host,
+                    type(error).__name__,
+                    str(error)[:160],
+                )
+        if public_quota_error:
+            raise public_quota_error
+        tap_label, tap_host = owner.TYPE_TUBE_TAP_CLUSTERS[0]
+        try:
+            tap_client, tap_track = _resolve_typetube_track_tap(target, tap_host)
+            logger.warning(
+                "All regional HTTP nodes failed; using the TypeTube %s fallback.",
+                tap_label,
+            )
+            return tap_track, tap_client, tap_host
+        except (TypeTubeOwnerKeyUnavailable, TypeTubeSDKVersionError,
+                TypeTubeFreeQuotaExhausted):
+            raise
+        except Exception as error:
+            logger.warning(
+                "TypeTube TAP fallback failed (%s): %s",
+                type(error).__name__, str(error)[:160],
+            )
+            return None, None, None
+    finally:
+        # ThreadPoolExecutor's context manager waits for every region, which
+        # turns one fast result into a several-second request. Keep only the
+        # winner and let in-flight losers finish under their short SDK timeout.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _prefetch_typetube_track(video_id: str, target: str):
     """Resolve a visible search result ahead of the user's selection."""
     client = None
@@ -991,16 +1315,29 @@ def _prefetch_typetube_track(video_id: str, target: str):
                     region_label, type(error).__name__,
                 )
         else:
-            raise RuntimeError(
-                "TypeTube could not pre-resolve this result from its available regions."
-            ) from last_region_error
+            tap_label, tap_host = owner.TYPE_TUBE_TAP_CLUSTERS[0]
+            try:
+                client, track = _resolve_typetube_track_tap(target, tap_host)
+                cluster_host = tap_host
+                logger.warning(
+                    "Regional prefetch failed; used the TypeTube %s fallback.",
+                    tap_label,
+                )
+            except (TypeTubeOwnerKeyUnavailable, TypeTubeSDKVersionError,
+                    TypeTubeFreeQuotaExhausted):
+                raise
+            except Exception as error:
+                raise RuntimeError(
+                    "TypeTube could not pre-resolve this result from its available regions."
+                ) from (last_region_error or error)
 
         track_id = youtube.get_video_id(str(getattr(track, "id", "") or ""))
+        audio_stream = _telegram_audio_stream(track)
         if (
             not getattr(track, "success", False)
             or track_id != video_id
-            or not getattr(track, "best_audio", None)
-            or not getattr(track.best_audio, "url", None)
+            or not audio_stream
+            or not getattr(audio_stream, "url", None)
         ):
             raise RuntimeError("TypeTube returned an invalid prefetched audio track.")
         return track, cluster_host, (time.perf_counter() - started) * 1000
@@ -1083,12 +1420,13 @@ def _get_prefetched_typetube_track(video_id: str | None):
 def _download_typetube_source(
     client, track, target: str, source_path: Path, cluster_host: str
 ):
-    """Download through an allowed regional cluster; rotate regions on 403."""
+    """Download a TypeTube stream and refresh it after regional HTTP errors."""
     cluster_hosts = [host for _, host in owner.TYPE_TUBE_CLUSTERS]
     try:
         current_index = cluster_hosts.index(cluster_host)
     except ValueError:
-        current_index = 0
+        current_index = -1
+    attempted_region_indexes = set()
 
     while True:
         try:
@@ -1110,28 +1448,32 @@ def _download_typetube_source(
             status_code = getattr(
                 error, "status_code", getattr(error, "code", None)
             )
-            if status_code != 403:
+            if status_code not in (403, 404, 410):
                 _close_typetube_client(client)
                 raise
             try:
                 rejected_host = urllib.parse.urlsplit(audio_stream.url).hostname or "unknown"
             except (TypeError, ValueError):
                 rejected_host = "unknown"
-            region_name = next(
-                (label for label, host in owner.TYPE_TUBE_CLUSTERS if host == cluster_host),
-                "unknown",
-            )
+            region_name = _typetube_region_label(cluster_host)
             logger.warning(
-                "TypeTube audio request returned 403 in region=%s host=%s; refreshing through the next region.",
-                region_name, rejected_host,
+                "TypeTube audio request returned HTTP %s in region=%s host=%s; refreshing the stream.",
+                status_code, region_name, rejected_host,
             )
+            if current_index >= 0:
+                attempted_region_indexes.add(current_index)
             _close_typetube_client(client)
             source_path.unlink(missing_ok=True)
-            next_region_index = current_index + 1
-            while next_region_index < len(cluster_hosts):
+            next_region_index = (
+                0 if current_index < 0 else (current_index + 1) % len(cluster_hosts)
+            )
+            while len(attempted_region_indexes) < len(cluster_hosts):
+                if next_region_index in attempted_region_indexes:
+                    next_region_index = (next_region_index + 1) % len(cluster_hosts)
+                    continue
                 next_label, next_host = owner.TYPE_TUBE_CLUSTERS[next_region_index]
                 logger.warning(
-                    "TypeTube returned a regional 403; retrying through %s.",
+                    "TypeTube returned a regional HTTP error; retrying through %s.",
                     next_label,
                 )
                 try:
@@ -1147,23 +1489,30 @@ def _download_typetube_source(
                         "TypeTube resolve failed in %s (%s); trying the next region.",
                         next_label, type(resolve_error).__name__,
                     )
-                    next_region_index += 1
+                    attempted_region_indexes.add(next_region_index)
+                    next_region_index = (next_region_index + 1) % len(cluster_hosts)
                     continue
                 if (
                     not getattr(refreshed_track, "success", False)
-                    or not getattr(refreshed_track, "best_audio", None)
-                    or not refreshed_track.best_audio.url
                 ):
                     _close_typetube_client(refreshed_client)
-                    raise RuntimeError(
-                        f"TypeTube could not provide an audio stream from {next_label}."
-                    ) from error
+                    logger.warning(
+                        "TypeTube returned no playable audio in %s; trying the next region.",
+                        next_label,
+                    )
+                    attempted_region_indexes.add(next_region_index)
+                    next_region_index = (next_region_index + 1) % len(cluster_hosts)
+                    continue
                 refreshed_audio_stream = _telegram_audio_stream(refreshed_track)
                 if not refreshed_audio_stream or not refreshed_audio_stream.url:
                     _close_typetube_client(refreshed_client)
-                    raise RuntimeError(
-                        f"TypeTube could not provide a Telegram-compatible audio stream from {next_label}."
-                    ) from error
+                    logger.warning(
+                        "TypeTube returned no compatible audio in %s; trying the next region.",
+                        next_label,
+                    )
+                    attempted_region_indexes.add(next_region_index)
+                    next_region_index = (next_region_index + 1) % len(cluster_hosts)
+                    continue
                 client, track = refreshed_client, refreshed_track
                 audio_stream = refreshed_audio_stream
                 cluster_host = next_host
@@ -1171,14 +1520,17 @@ def _download_typetube_source(
                 break
             else:
                 logger.error(
-                    "TypeTube audio URL returned 403 in every available cluster."
+                    "All resolvable TypeTube URLs failed direct access from this server."
                 )
-                raise
+                raise TypeTubeSourceBlocked(audio_stream) from error
     raise RuntimeError("TypeTube audio download failed after refreshing the stream.")
 
 
 def download_song_to_ram(
-    query: str, metadata_callback=None, picked_override: dict | None = None
+    query: str,
+    metadata_callback=None,
+    picked_override: dict | None = None,
+    allow_telegram_fallback: bool = False,
 ) -> dict:
     """Resolve with TypeTube and return a Telegram-ready audio stream."""
     query = str(query or "").strip()
@@ -1212,44 +1564,30 @@ def download_song_to_ram(
         resolve_seconds = time.perf_counter() - resolve_started
         logger.info(
             "SOURCE_RESOLVE_CACHE_HIT provider=TypeTube region=%s took=%.1fms id=%s",
-            next(label for label, host in owner.TYPE_TUBE_CLUSTERS if host == cluster_host),
+            _typetube_region_label(cluster_host),
             resolve_seconds * 1000,
             prefetched_video_id,
         )
     else:
         client = track = cluster_host = None
-        last_region_error = None
-        for region_label, candidate_host in owner.TYPE_TUBE_CLUSTERS:
-            try:
-                client, track = _resolve_typetube_track(target, candidate_host)
-                cluster_host = candidate_host
-                break
-            except TypeTubeOwnerKeyUnavailable:
-                raise
-            except TypeTubeSDKVersionError:
-                raise
-            except TypeTubeFreeQuotaExhausted as error:
-                last_region_error = error
-                logger.warning(
-                    "TypeTube public access is unavailable in %s; trying the next region.",
-                    region_label,
-                )
-            except Exception as error:
-                last_region_error = error
-                logger.warning(
-                    "TypeTube resolve failed in %s (%s); trying the next region.",
-                    region_label, type(error).__name__,
-                )
-        if client is None or track is None or cluster_host is None:
+        resolve_started = time.perf_counter()
+
+        # Run ALL TypeTube regions in parallel via ThreadPoolExecutor, pick fastest
+        region_results = _resolve_all_regions_parallel_sync(target)
+
+        track, client, cluster_host = region_results
+        if track is None:
             raise RuntimeError(
-                "TypeTube could not resolve this track from its available regions."
-            ) from last_region_error
+                "TypeTube could not resolve this track from any region."
+            )
+        if cluster_host is None:
+            _close_typetube_client(client)
+            raise RuntimeError("TypeTube returned an unknown resolver region.")
         resolve_seconds = time.perf_counter() - resolve_started
     if (
         not getattr(track, "success", False)
         or not getattr(track, "id", None)
-        or not getattr(track, "best_audio", None)
-        or not getattr(track.best_audio, "url", None)
+        or not getattr(_telegram_audio_stream(track), "url", None)
     ):
         _close_typetube_client(client)
         raise RuntimeError("TypeTube did not return a playable audio stream.")
@@ -1285,18 +1623,90 @@ def download_song_to_ram(
 
     logger.info(
         "SOURCE_RESOLVE provider=TypeTube region=%s took %.2fs latency=%.0fms id=%s",
-        next(label for label, host in owner.TYPE_TUBE_CLUSTERS if host == cluster_host),
+        _typetube_region_label(cluster_host),
         resolve_seconds,
         getattr(track, "latency_ms", 0) or 0,
         video_id,
     )
+
+    # Let Telegram fetch small MP3/M4A streams directly. This avoids a
+    # complete download to the bot followed by a second upload, and it
+    # avoids the bot server's region-specific route to YouTube's CDN.
+    if allow_telegram_fallback:
+        remote_meta = _telegram_remote_audio_meta(
+            _telegram_audio_stream(track),
+            track,
+            video_id=video_id,
+            target=target,
+            title=display_title,
+            artist=display_artist,
+            duration=duration,
+        )
+        if remote_meta:
+            _close_typetube_client(client)
+            logger.info(
+                "SOURCE_DOWNLOAD provider=TypeTube mode=telegram_url_fetch size=%.2fMiB",
+                remote_meta["size_mb"],
+            )
+            return remote_meta
+
     with tempfile.TemporaryDirectory(prefix="songbot_") as tmpdir:
         source_path = Path(tmpdir) / f"source-{video_id}.audio"
         mp3_path = Path(tmpdir) / f"{video_id}.mp3"
         download_started = time.perf_counter()
-        client, track, audio_stream, bytes_written, average_speed = _download_typetube_source(
-            client, track, target, source_path, cluster_host
-        )
+        source_provider = "TypeTube"
+        try:
+            client, track, audio_stream, bytes_written, average_speed = _download_typetube_source(
+                client, track, target, source_path, cluster_host
+            )
+        except TypeTubeSourceBlocked as error:
+            _close_typetube_client(client)
+            try:
+                audio_stream, bytes_written, average_speed = (
+                    _download_youtube_audio_fallback(target, source_path)
+                )
+                source_provider = "YouTubePlayer"
+                logger.info(
+                    "TypeTube URLs were blocked; downloaded a fresh YouTube player stream."
+                )
+            except Exception as fallback_error:
+                logger.warning(
+                    "Local YouTube player fallback failed (%s).",
+                    type(fallback_error).__name__,
+                )
+                audio_stream = error.audio_stream
+                if not allow_telegram_fallback:
+                    raise SongSourceUnavailable(
+                        "The audio source is unreachable from this server. Please try again later."
+                    ) from fallback_error
+                mime_type = str(getattr(audio_stream, "mime_type", "") or "").lower()
+                if not any(marker in mime_type for marker in ("mp4", "m4a", "mpeg", "mp3")):
+                    raise RuntimeError(
+                        "Telegram cannot fetch this audio source as MP3/M4A audio."
+                    ) from fallback_error
+                source_size = _audio_stream_size_bytes(audio_stream)
+                if source_size and source_size > TELEGRAM_URL_FETCH_MAX_BYTES:
+                    raise RuntimeError(
+                        "The source exceeds Telegram's 20 MB URL-fetch limit."
+                    ) from fallback_error
+                remote_meta = _telegram_remote_audio_meta(
+                    audio_stream,
+                    track,
+                    video_id=video_id,
+                    target=target,
+                    title=display_title,
+                    artist=display_artist,
+                    duration=duration,
+                )
+                if not remote_meta:
+                    raise SongSourceUnavailable(
+                        "The audio source is unreachable from this server. Please try again later."
+                    ) from fallback_error
+                logger.warning(
+                    "SOURCE_DOWNLOAD provider=TypeTube mode=telegram_url_fetch size=%.2fMiB",
+                    remote_meta["size_mb"],
+                )
+                return remote_meta
         _close_typetube_client(client)
         del client
         download_seconds = time.perf_counter() - download_started
@@ -1311,7 +1721,8 @@ def download_song_to_ram(
         if average_speed is None:
             average_speed = bytes_written / (1024 * 1024) / max(download_seconds, 0.01)
         logger.info(
-            "SOURCE_DOWNLOAD provider=TypeTube took %.2fs size=%.2fMB rate=%.2fMB/s",
+            "SOURCE_DOWNLOAD provider=%s took %.2fs size=%.2fMB rate=%.2fMB/s",
+            source_provider,
             download_seconds,
             source_mb,
             average_speed,
@@ -1356,14 +1767,16 @@ def download_song_to_ram(
                 raise RuntimeError(f"Could not convert TypeTube audio to MP3: {detail[:200]}")
             transcode_seconds = time.perf_counter() - transcode_started
             logger.info(
-                "SOURCE_TRANSCODE provider=TypeTube mode=mp3 bitrate=%sk took %.2fs",
+                "SOURCE_TRANSCODE provider=%s mode=mp3 bitrate=%sk took %.2fs",
+                source_provider,
                 MP3_QUALITY,
                 transcode_seconds,
             )
         else:
             transcode_seconds = time.perf_counter() - transcode_started
             logger.info(
-                "SOURCE_TRANSCODE provider=TypeTube mode=passthrough format=%s took %.2fs",
+                "SOURCE_TRANSCODE provider=%s mode=passthrough format=%s took %.2fs",
+                source_provider,
                 stream_copy_format,
                 transcode_seconds,
             )
@@ -2752,7 +3165,11 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
         download_task = asyncio.create_task(
             asyncio.to_thread(
-                download_song_to_ram, query, on_metadata_ready, recognition_candidate
+                download_song_to_ram,
+                query,
+                on_metadata_ready,
+                recognition_candidate,
+                allow_telegram_fallback=(default_fx == "off"),
             )
         )
         metadata_task = asyncio.create_task(metadata_queue.get())
@@ -2804,12 +3221,13 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         duration = int(meta.get("duration") or 0)
         album = meta.get("album")
-        original_audio_data = meta["audio_bytes"]
+        original_audio_data = meta.get("audio_bytes")
         original_audio_filename = meta.get(
             "audio_filename", f"{meta['id']}.mp3"
         )
         base_title = meta["title"]
         applied_effect = "off"
+        remote_only = bool(meta.get("remote_only"))
 
         # Default effect from /settings: render before upload.
         if default_fx in EFFECTS:
@@ -2837,27 +3255,46 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             except Exception as e:
                 logger.warning("Default effect render failed, sending plain: %s", str(e)[:150])
 
-        await status.edit_text(
-            uploading_status_html(meta["title"][:60], meta["size_mb"]),
-            parse_mode="HTML",
-        )
+        if remote_only:
+            await status.edit_text(
+                status_html(
+                    UPLOAD_ICON,
+                    "⬆️",
+                    "Telegram is fetching the audio…",
+                    f"<code>{_esc(_no_dashes(meta['title'][:60]))}</code>",
+                ),
+                parse_mode="HTML",
+            )
+        else:
+            await status.edit_text(
+                uploading_status_html(meta["title"][:60], meta["size_mb"]),
+                parse_mode="HTML",
+            )
         await update.message.chat.send_action(ChatAction.UPLOAD_VOICE)
 
-        audio_data = meta["audio_bytes"]
-        audio_file = InputFile(
-            audio_data,
-            filename=meta.get("audio_filename", f"{meta['id']}.mp3"),
+        audio_data = meta.get("audio_bytes")
+        audio_file = (
+            meta["remote_audio_url"]
+            if remote_only
+            else InputFile(
+                audio_data,
+                filename=meta.get("audio_filename", f"{meta['id']}.mp3"),
+            )
         )
 
         # Upload duration depends on file size, connection speed, and Telegram processing.
         # No caption: curated title/performer + album-art thumbnail card.
         performer = _no_dashes(meta.get("uploader") or "")[:64] or None
         thumb_data = meta.get("cover_bytes")
-        thumb_file = InputFile(thumb_data, filename="cover.jpg") if thumb_data else None
+        thumb_file = (
+            InputFile(thumb_data, filename="cover.jpg")
+            if thumb_data and not remote_only else None
+        )
         t_up = time.perf_counter()
         telegram_request_seconds = 0.0
         sent = None
-        for attempt in (1, 2, 3):
+        attempt = 1
+        while attempt <= 3:
             try:
                 request_started = time.perf_counter()
                 sent = await update.message.reply_audio(
@@ -2880,6 +3317,51 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 wait = 3 * attempt
                 logger.warning("Telegram upload timed out (attempt %d/3); retrying in %ds...", attempt, wait)
                 await asyncio.sleep(wait)
+                attempt += 1
+            except BadRequest as error:
+                if not remote_only:
+                    raise
+                logger.warning(
+                    "Telegram could not fetch the TypeTube audio URL: %s",
+                    str(error)[:160],
+                )
+                # Some TypeTube URLs work from Telegram but not from its Bot
+                # API fetcher. Fall back to the normal local transfer once.
+                local_meta = await asyncio.to_thread(
+                    download_song_to_ram,
+                    query,
+                    None,
+                    recognition_candidate,
+                    False,
+                )
+                meta = local_meta
+                remote_only = False
+                audio_data = meta.get("audio_bytes")
+                audio_file = InputFile(
+                    audio_data,
+                    filename=meta.get("audio_filename", f"{meta['id']}.mp3"),
+                )
+                duration = int(meta.get("duration") or 0)
+                album = meta.get("album")
+                base_title = meta["title"]
+                original_audio_data = audio_data
+                original_audio_filename = meta.get(
+                    "audio_filename", f"{meta['id']}.mp3"
+                )
+                thumb_data = meta.get("cover_bytes")
+                thumb_file = (
+                    InputFile(thumb_data, filename="cover.jpg")
+                    if thumb_data else None
+                )
+                performer = _no_dashes(meta.get("uploader") or "")[:64] or None
+                await status.edit_text(
+                    uploading_status_html(meta["title"][:60], meta["size_mb"]),
+                    parse_mode="HTML",
+                )
+                t_up = time.perf_counter()
+                telegram_request_seconds = 0.0
+                attempt = 1
+                continue
         upload_stage_seconds = time.perf_counter() - t_up
         upload_mbps = (
             len(audio_data) * 8 / upload_stage_seconds / 1_000_000
@@ -2910,6 +3392,7 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "cover_bytes": thumb_data,
             "original_audio_bytes": original_audio_data,
             "original_audio_filename": original_audio_filename,
+            "remote_only": remote_only,
             "playlist_only": no_controls,
         })
         if sent and sent.audio and sent.audio.file_id:
@@ -2932,7 +3415,10 @@ async def song(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status.delete()
 
     except Exception as e:
-        logger.exception("Failed to process /song %s", query)
+        if isinstance(e, SongSourceUnavailable):
+            logger.warning("Song source unavailable for /song %s: %s", query, e)
+        else:
+            logger.exception("Failed to process /song %s", query)
         err_msg = error_html("Download failed", friendly_error(e))
         try:
             await status.edit_text(err_msg, parse_mode="HTML")
@@ -3548,6 +4034,13 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if group == "menu" and op == "edit":
         await q.edit_message_reply_markup(reply_markup=edit_menu(chat_id, msg_id))
     elif group == "menu" and op == "fx":
+        if sess and sess.get("remote_only"):
+            await context.bot.send_message(
+                chat_id,
+                "Effects aren't available for this song because Telegram fetched it directly from YouTube.",
+                reply_to_message_id=msg_id,
+            )
+            return
         active_effect = (
             _session_effect(sess) if sess else "off"
         )

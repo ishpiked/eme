@@ -183,7 +183,7 @@ async def _run_shazam(sample_path: Path) -> dict:
 
     retry_options = ExponentialRetry(
         attempts=2,
-        max_timeout=2,
+        max_timeout=1,
         statuses={429, 500, 502, 503, 504},
     )
     shazam = Shazam(http_client=HTTPClient(retry_options=retry_options))

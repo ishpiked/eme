@@ -22,11 +22,35 @@ from telegram.ext import ApplicationHandlerStop, ContextTypes
 logger = logging.getLogger(__name__)
 
 OWNER_ID = int(os.getenv("BOT_OWNER_ID", "0") or 0)
+# Experimental HTTPS resolver nodes. Their /resolve API returns stream URLs
+# generated from each node's region; the nodes are not TAP endpoints.
 TYPE_TUBE_CLUSTERS = (
-    ("Netherlands", "tap://nl.clusters.typetube.xyz"),
-    ("Singapore", "tap://sg.clusters.typetube.xyz"),
-    ("India", "tap://in.clusters.typetube.xyz"),
+    ("Germany", "https://de.node.typetube.xyz"),
+    ("India", "https://in.node.typetube.xyz"),
+    ("Singapore", "https://sg.node.typetube.xyz"),
+    ("Netherlands", "https://nl.node.typetube.xyz"),
+    ("United States", "https://us.node.typetube.xyz"),
+    ("France", "https://fr.node.typetube.xyz"),
+    ("United Kingdom", "https://uk.node.typetube.xyz"),
+    ("Japan", "https://jp.node.typetube.xyz"),
+    ("South Korea", "https://kr.node.typetube.xyz"),
+    ("Australia", "https://au.node.typetube.xyz"),
 )
+# The Python SDK uses TAP for API-key validation and the last-resort fallback.
+TYPE_TUBE_TAP_CLUSTERS = (
+    ("Singapore TAP", "sg.clusters.typetube.xyz"),
+)
+
+
+def typetube_sdk_host(cluster_host: str) -> str:
+    """Convert a configured cluster URL to the hostname expected by TypeTube TAP."""
+    value = str(cluster_host or "").strip()
+    parsed = urlparse(value if "://" in value else f"//{value}")
+    if not parsed.hostname:
+        raise ValueError("Invalid TypeTube cluster host.")
+    return parsed.hostname
+
+
 BROADCAST_MAX_BUTTONS = 10
 BROADCAST_MAX_BUTTONS_PER_ROW = 2
 BROADCAST_MAX_ROWS = 5
@@ -641,10 +665,10 @@ class OwnerConsole:
 
                 def validate_key() -> None:
                     last_error = None
-                    for _, cluster_host in TYPE_TUBE_CLUSTERS:
+                    for _, cluster_host in TYPE_TUBE_TAP_CLUSTERS:
                         client = create_client(
                             api_key=key,
-                            host=cluster_host,
+                            host=typetube_sdk_host(cluster_host),
                             port=8443,
                             timeout_ms=10000,
                         )

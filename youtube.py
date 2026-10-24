@@ -50,7 +50,7 @@ DOWNLOAD_WORKERS = 16
 DOWNLOAD_CHUNK_SIZE = 1 * 1024 * 1024
 _VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _AUDIO_CODEC_RE = re.compile(r"(?:mp4a|opus|vorbis|aac|mp3|alac|flac)", re.I)
-SEARCH_TIMEOUT = 12
+SEARCH_TIMEOUT = 6
 MAX_SEARCH_RESPONSE_BYTES = 12 * 1024 * 1024
 
 
@@ -320,7 +320,7 @@ def resolve(value: str) -> dict:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=15) as response:
+            with urllib.request.urlopen(request, timeout=8) as response:
                 candidate = json.loads(response.read().decode("utf-8"))
         except (
             urllib.error.URLError,

@@ -34,17 +34,6 @@ class AudioEffectsTests(unittest.TestCase):
         self.assertIn("volume=0.30[depth]", graph)
         self.assertIn("volume=0.78[direct]", graph)
 
-    def test_phonk_is_deterministic_and_shapes_source_rhythm_without_generated_beats(self):
-        build = emyfx.PRESETS["phonk"]["build"]
-        graph = build(120.0)
-        self.assertEqual(graph, build(120.0))
-        self.assertIn("lowpass=f=150,bass=g=5:f=75", graph)
-        self.assertIn("acompressor=threshold=0.18:ratio=2.8:attack=7:release=90", graph)
-        self.assertIn("asoftclip=type=tanh", graph)
-        self.assertNotIn("anoisesrc", graph)
-        self.assertNotIn("aevalsrc", graph)
-        self.assertNotIn("random(", graph)
-
     def test_dreamy_has_filtered_spacious_reverb_over_a_clear_dry_signal(self):
         graph = emyfx.PRESETS["dreamy"]["build"](120.0)
         self.assertIn("highpass=f=180,lowpass=f=12000", graph)
